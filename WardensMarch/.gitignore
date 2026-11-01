@@ -1,0 +1,10 @@
+# built outputs
+export_song.exe
+*.rspbin
+*.bin
+*.z64
+*.sym
+*.asm
+*.txt
+*.pak
+*.ram

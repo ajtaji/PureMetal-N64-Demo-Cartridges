@@ -1,0 +1,1084 @@
+; ======================================================================
+;  wk_synth.rsp - the Warden's Key synthesiser, on the Nintendo 64's RSP
+; ======================================================================
+;  Assembled by PureMetal Forge's RSP assembler (.rspfile in wk_rsp.n64).
+;
+;  ONE TASK RENDERS ONE AUDIO BUFFER: a number of blocks of 64 stereo samples
+;  at 48 kHz. The CPU (wk_rsp.n64) runs the game's sequencer, voices, pitch
+;  and envelopes at the engine's 32-sample control rate and leaves, in RDRAM,
+;  160-byte records a block: a header (the voice count) and one record per
+;  sounding voice. Per sample, here: the oscillators (the engine's wavetables
+;  at 512 steps with linear interpolation, its noise register, its 4-operator
+;  FM on its own sine table), the gain between control points, pan and the
+;  reverb send; then the engine's reverb - four combs and two all-passes a
+;  side - and the samples into the buffer the audio interface plays.
+;
+;  WHERE THIS IS NOT THE ENGINE, BY DESIGN: gains and FM amplitudes are
+;  linear between the 32-sample control points the CPU computes (the engine
+;  moves them every sample); products round (VMULF) where the engine
+;  truncates; sums saturate at 16 bits; the reverb's delay lengths are
+;  rounded to multiples of 4 samples (DMA moves 8 bytes at a time) - at most
+;  2 samples, 0.04 ms, from the engine's.
+;
+;  THE RECORD (big-endian): 0 kind (1 wave, 2 noise, 3 FM; the header's: the
+;  voice count), 2 voice, 4 first sample (a multiple of 8), 6 flags (1: a new
+;  note - clear its FM feedback), 8/10/12 the gain at samples 0, 32, 64 (Q15),
+;  14 pan left, 16 pan right, 18 send (Q15), 20 the wavetable (RDRAM) or the
+;  noise register, 24 the phase, 28/32 the increment for samples 0-31/32-63,
+;  36 the noise value. FM: 40 the feedback shift (0: none), 42 the output
+;  (four slot numbers, 4 bits each), 44 + 24 x op: phase, inc 0-31,
+;  inc 32-63, amp at 0, 32, 64 (Q15 = FmAmp x 4), modulation slots A, B.
+;  FM slots (OPVV): 0-3 the operators' outputs, 4 zeros.
+;
+;  TASK (DMEM 0, written by the CPU): +0 the blocks built so far (the CPU
+;  raises it WHILE the task runs, as it builds them), +4 the records (RDRAM),
+;  +8 the output (RDRAM), +12 the comb lines (8 x 4 KB), +16 the all-pass
+;  lines (4 x 2 KB), all 16-bit samples in RDRAM, +20 set by the CPU when
+;  another program wants the RSP, +24 the blocks this task is to render;
+;  written back: +28 the blocks it rendered.
+;
+;  ONE TASK KEEPS GOING: it renders each block as soon as the CPU has built
+;  it (waiting for it here if need be), and stops when all of them are done
+;  or when it is asked to give the RSP up - so the RSP never sits idle
+;  waiting for the CPU to notice that a piece of music has finished.
+; ======================================================================
+.data
+task:   .space 32
+; THE STATE that outlives a task (176 bytes at DMEM 32): the CPU saves it to
+; RDRAM after each task and puts it back before the next, so the RSP can run
+; other code (the graphics) between two pieces of music
+fbst:   .space 128
+rvpos:  .space 16
+appos:  .space 8
+rvlp:   .space 16
+stpad2: .space 8
+sinq:   .space 2064
+mixl:   .space 128
+mixr:   .space 128
+mixs:   .space 128
+stage:  .space 1024
+stpad:  .space 16
+rec:    .space 160
+osca:   .space 16
+oscd:   .space 16
+oscf:   .space 16
+opvv:   .space 80
+fidx:   .space 16
+famp:   .space 16
+rvlen:  .half 1696, 1760, 1624, 1548, 1720, 1784, 1648, 1572
+aplen:  .half 604, 244, 628, 268
+        .align 16
+ramp:   .half 0, 1, 2, 3, 4, 5, 6, 7
+kons:   .half 26214, 6554, 27525, 9830, 4095, 1023, sinq, 32768
+kons2:  .half 1024, 2048, 0, 0, 0, 0, 0, 0
+.text
+start:
+    addiu s7, zero, 0
+    lw s6, task+4(zero)
+    lw fp, task+8(zero)
+    addiu t0, zero, ramp
+    lqv $v31[0], 0(t0)
+    lqv $v30[0], 16(t0)
+    lqv $v21[0], 32(t0)
+block:
+    lw t0, task+20(zero)
+    bne t0, zero, finish
+    nop
+    lw t0, task+24(zero)
+    beq s7, t0, finish
+    nop
+    lw t0, task+0(zero)
+    slt t1, s7, t0
+    beq t1, zero, block
+    nop
+    vxor $v0, $v0, $v0
+    addiu t0, zero, mixl
+    addiu t1, zero, 24
+zmix:
+    sqv $v0[0], 0(t0)
+    addiu t0, t0, 16
+    addiu t1, t1, -1
+    bne t1, zero, zmix
+    nop
+    addiu a0, zero, rec
+    addu a1, s6, zero
+    jal dmain
+    addiu a2, zero, 160
+    lh s5, rec+0(zero)
+    addiu s6, s6, 160
+voices:
+    beq s5, zero, reverb
+    nop
+    addiu a0, zero, rec
+    addu a1, s6, zero
+    jal dmain
+    addiu a2, zero, 160
+    addiu s6, s6, 160
+    addiu s5, s5, -1
+    lh t0, rec+0(zero)
+    addiu t1, zero, 1
+    beq t0, t1, wave
+    nop
+    addiu t1, zero, 2
+    beq t0, t1, noise
+    nop
+    addiu t1, zero, 3
+    beq t0, t1, fm
+    nop
+    j voices
+    nop
+
+; ---- DMA: a0 DMEM, a1 RDRAM, a2 bytes (a multiple of 8) ---------------
+dmain:
+    mfc0 t8, $6
+    bne t8, zero, dmain
+    nop
+    mtc0 a0, $0
+    mtc0 a1, $1
+    addiu t8, a2, -1
+    mtc0 t8, $2
+dmainw:
+    mfc0 t8, $6
+    bne t8, zero, dmainw
+    nop
+    jr ra
+    nop
+dmaout:
+    mfc0 t8, $6
+    bne t8, zero, dmaout
+    nop
+    mtc0 a0, $0
+    mtc0 a1, $1
+    addiu t8, a2, -1
+    mtc0 t8, $3
+dmaoutw:
+    mfc0 t8, $6
+    bne t8, zero, dmaoutw
+    nop
+    jr ra
+    nop
+
+; ---- the gain for the 8 samples from s4: g(cf) + (g(cf+1) - g(cf)) / 32 x k
+gainvec:
+    srl t0, s4, 5
+    sll t0, t0, 1
+    lh t1, rec+8(t0)
+    lh t2, rec+10(t0)
+    subu t2, t2, t1
+    sra t3, t2, 5
+    andi a4, s4, 31
+    mtc2 t3, $v28[0]
+    mtc2 a4, $v28[2]
+    mtc2 t1, $v28[4]
+    vadd $v27, $v31, $v28[1]
+    vmudh $v29, $v27, $v28[0]
+    vadd $v29, $v29, $v28[2]
+    jr ra
+    nop
+
+; ---- v26 (8 values) x the gain into MIXL / MIXR / MIXS at sample s4 ----
+mix8:
+    vmulf $v26, $v26, $v29
+    lh t0, rec+14(zero)
+    mtc2 t0, $v25[0]
+    lh t0, rec+16(zero)
+    mtc2 t0, $v25[2]
+    lh t0, rec+18(zero)
+    mtc2 t0, $v25[4]
+    sll t1, s4, 1
+    addiu t2, t1, mixl
+    lqv $v24[0], 0(t2)
+    vmulf $v23, $v26, $v25[0]
+    vadd $v24, $v24, $v23
+    sqv $v24[0], 0(t2)
+    addiu t2, t1, mixr
+    lqv $v24[0], 0(t2)
+    vmulf $v23, $v26, $v25[1]
+    vadd $v24, $v24, $v23
+    sqv $v24[0], 0(t2)
+    addiu t2, t1, mixs
+    lqv $v24[0], 0(t2)
+    vmulf $v23, $v26, $v25[2]
+    vadd $v24, $v24, $v23
+    sqv $v24[0], 0(t2)
+    jr ra
+    nop
+
+; ======================================================================
+;  A WAVETABLE VOICE: its 512-step table into STAGE; then 8 samples at a
+;  time: idx = phase >> 23, fraction = (phase >> 8) & $7FFF, a + 2 x ((b - a) / 2 x f)
+; ======================================================================
+wave:
+    addiu a0, zero, stage
+    lw a1, rec+20(zero)
+    jal dmain
+    addiu a2, zero, 1024
+    lh t0, stage(zero)
+    sh t0, stage+1024(zero)
+    lw s0, rec+24(zero)
+    lh s4, rec+4(zero)
+wvec:
+    slti t0, s4, 64
+    beq t0, zero, voices
+    nop
+    srl t0, s4, 5
+    sll t0, t0, 2
+    lw s1, rec+28(t0)
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+0(zero)
+    sh t3, oscd+0(zero)
+    sh a4, oscf+0(zero)
+    addu s0, s0, s1
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+2(zero)
+    sh t3, oscd+2(zero)
+    sh a4, oscf+2(zero)
+    addu s0, s0, s1
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+4(zero)
+    sh t3, oscd+4(zero)
+    sh a4, oscf+4(zero)
+    addu s0, s0, s1
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+6(zero)
+    sh t3, oscd+6(zero)
+    sh a4, oscf+6(zero)
+    addu s0, s0, s1
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+8(zero)
+    sh t3, oscd+8(zero)
+    sh a4, oscf+8(zero)
+    addu s0, s0, s1
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+10(zero)
+    sh t3, oscd+10(zero)
+    sh a4, oscf+10(zero)
+    addu s0, s0, s1
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+12(zero)
+    sh t3, oscd+12(zero)
+    sh a4, oscf+12(zero)
+    addu s0, s0, s1
+    srl t1, s0, 22
+    andi t1, t1, 1022
+    lh t2, stage(t1)
+    lh t3, stage+2(t1)
+    srl a4, s0, 8
+    andi a4, a4, 32767
+    subu t3, t3, t2
+    sra t3, t3, 1
+    sh t2, osca+14(zero)
+    sh t3, oscd+14(zero)
+    sh a4, oscf+14(zero)
+    addu s0, s0, s1
+    addiu t0, zero, osca
+    lqv $v1[0], 0(t0)
+    lqv $v2[0], 16(t0)
+    lqv $v3[0], 32(t0)
+    vmulf $v4, $v2, $v3
+    vadd $v26, $v1, $v4
+    vadd $v26, $v26, $v4
+    jal gainvec
+    nop
+    jal mix8
+    nop
+    j wvec
+    addiu s4, s4, 8
+
+; ======================================================================
+;  A NOISE VOICE: sample and hold, the register stepped at each phase wrap
+; ======================================================================
+noise:
+    lw s0, rec+24(zero)
+    lw s3, rec+20(zero)
+    lh s1, rec+36(zero)
+    lh s4, rec+4(zero)
+nvec:
+    slti t0, s4, 64
+    beq t0, zero, voices
+    nop
+    srl t0, s4, 5
+    sll t0, t0, 2
+    lw t9, rec+28(t0)
+    addiu s2, zero, 0
+nlane:
+    addu s0, s0, t9
+    sltu t0, s0, t9
+    beq t0, zero, nhold
+    nop
+    srl t1, s3, 3
+    xor t1, s3, t1
+    andi t1, t1, 1
+    sll t1, t1, 16
+    srl t2, s3, 1
+    or s3, t2, t1
+    lui t1, 1
+    ori t1, t1, 65535
+    and s3, s3, t1
+    andi s1, s3, 16383
+    addiu s1, s1, -8192
+nhold:
+    sh s1, osca(s2)
+    addiu s2, s2, 2
+    slti t0, s2, 16
+    bne t0, zero, nlane
+    nop
+    addiu t0, zero, osca
+    lqv $v26[0], 0(t0)
+    jal gainvec
+    nop
+    jal mix8
+    nop
+    j nvec
+    addiu s4, s4, 8
+
+; ======================================================================
+;  AN FM VOICE, an operator 8 samples at a time (an operator reads only the
+;  lower operators of the same sample), each the engine's MU_OP:
+;    md = (slot A + slot B) >> 1, s = FmSin(((phase >> 20) + md) & 4095),
+;    o = s x amp, phase += inc
+;  OPVV holds the slots as vectors: 0-3 the operators' 8 outputs, 4 zeros.
+;  Operator 0 with feedback reads its own last two outputs, md = (p1 + p2)
+;  >> (9 - fb), so it is done a sample at a time.
+; ======================================================================
+fm:
+    lh t0, rec+2(zero)
+    sll t0, t0, 2
+    addiu s3, t0, fbst
+    lh t1, rec+6(zero)
+    andi t1, t1, 1
+    beq t1, zero, fmkeep
+    nop
+    sw zero, 0(s3)
+fmkeep:
+    lh s0, 0(s3)
+    lh s1, 2(s3)
+    addiu t0, zero, opvv
+    sqv $v0[0], 64(t0)
+    lh s4, rec+4(zero)
+fvec:
+    slti t0, s4, 64
+    beq t0, zero, fmdone
+    nop
+    addiu s2, zero, 0
+fop:
+    sll t0, s2, 3
+    sll t1, s2, 4
+    addu t0, t0, t1
+    addiu a3, t0, rec+44
+; the amplitude for the 8 samples: amp(cf) + (amp(cf+1) - amp(cf)) / 32 x k
+    srl t0, s4, 5
+    sll t0, t0, 1
+    addu t0, t0, a3
+    lh t1, 12(t0)
+    lh t2, 14(t0)
+    subu t2, t2, t1
+    sra t3, t2, 5
+    andi a4, s4, 31
+    mtc2 t3, $v8[0]
+    mtc2 a4, $v8[2]
+    mtc2 t1, $v8[4]
+    vadd $v9, $v31, $v8[1]
+    vmudh $v7, $v9, $v8[0]
+    vadd $v7, $v7, $v8[2]
+; the phase and this half's increment
+    srl t0, s4, 5
+    sll t0, t0, 2
+    addu t0, t0, a3
+    lw t2, 4(t0)
+    lw a5, 0(a3)
+    bne s2, zero, fvop
+    nop
+    lh t3, rec+40(zero)
+    bne t3, zero, ffb
+    nop
+fvop:
+    srl t1, a5, 20
+    sh t1, fidx+0(zero)
+    addu a5, a5, t2
+    srl t1, a5, 20
+    sh t1, fidx+2(zero)
+    addu a5, a5, t2
+    srl t1, a5, 20
+    sh t1, fidx+4(zero)
+    addu a5, a5, t2
+    srl t1, a5, 20
+    sh t1, fidx+6(zero)
+    addu a5, a5, t2
+    srl t1, a5, 20
+    sh t1, fidx+8(zero)
+    addu a5, a5, t2
+    srl t1, a5, 20
+    sh t1, fidx+10(zero)
+    addu a5, a5, t2
+    srl t1, a5, 20
+    sh t1, fidx+12(zero)
+    addu a5, a5, t2
+    srl t1, a5, 20
+    sh t1, fidx+14(zero)
+    addu a5, a5, t2
+    sw a5, 0(a3)
+    addiu t0, zero, fidx
+    lqv $v10[0], 0(t0)
+; the modulation, (slot A + slot B) >> 1
+    lh t1, 18(a3)
+    sll t1, t1, 4
+    addiu t1, t1, opvv
+    lqv $v11[0], 0(t1)
+    lh t1, 20(a3)
+    sll t1, t1, 4
+    addiu t1, t1, opvv
+    lqv $v12[0], 0(t1)
+    vadd $v11, $v11, $v12
+    vmudm $v11, $v11, $v30[7]
+    vadd $v10, $v10, $v11
+    vand $v10, $v10, $v30[4]
+; FmSin from the quarter wave: r = i & 1023, mirrored in the odd quarters,
+; negated in the second half
+    vand $v13, $v10, $v30[5]
+    vand $v14, $v10, $v21[0]
+    vsub $v15, $v14, $v13
+    veq $v16, $v14, $v0
+    vmrg $v13, $v13, $v15
+    vadd $v13, $v13, $v13
+    vadd $v13, $v13, $v30[6]
+    vand $v17, $v10, $v21[1]
+    sqv $v13[0], 0(t0)
+    lh t1, fidx+0(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+0(zero)
+    lh t1, fidx+2(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+2(zero)
+    lh t1, fidx+4(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+4(zero)
+    lh t1, fidx+6(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+6(zero)
+    lh t1, fidx+8(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+8(zero)
+    lh t1, fidx+10(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+10(zero)
+    lh t1, fidx+12(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+12(zero)
+    lh t1, fidx+14(zero)
+    lh t1, 0(t1)
+    sh t1, fidx+14(zero)
+    lqv $v18[0], 0(t0)
+    vsub $v19, $v0, $v18
+    veq $v16, $v17, $v0
+    vmrg $v18, $v18, $v19
+    vmulf $v18, $v18, $v7
+    sll t1, s2, 4
+    addiu t1, t1, opvv
+    sqv $v18[0], 0(t1)
+fopnext:
+    addiu s2, s2, 1
+    slti t0, s2, 4
+    bne t0, zero, fop
+    nop
+; the voice's value: its output slots summed
+    lh t0, rec+42(zero)
+    vxor $v26, $v26, $v26
+    andi t1, t0, 15
+    sll t1, t1, 4
+    addiu t1, t1, opvv
+    lqv $v20[0], 0(t1)
+    vadd $v26, $v26, $v20
+    srl t0, t0, 4
+    andi t1, t0, 15
+    sll t1, t1, 4
+    addiu t1, t1, opvv
+    lqv $v20[0], 0(t1)
+    vadd $v26, $v26, $v20
+    srl t0, t0, 4
+    andi t1, t0, 15
+    sll t1, t1, 4
+    addiu t1, t1, opvv
+    lqv $v20[0], 0(t1)
+    vadd $v26, $v26, $v20
+    srl t0, t0, 4
+    andi t1, t0, 15
+    sll t1, t1, 4
+    addiu t1, t1, opvv
+    lqv $v20[0], 0(t1)
+    vadd $v26, $v26, $v20
+    srl t0, t0, 4
+    jal gainvec
+    nop
+    jal mix8
+    nop
+    j fvec
+    addiu s4, s4, 8
+; operator 0 with feedback, a sample at a time: p1 s0, p2 s1, the shift t3
+ffb:
+    addiu t0, zero, famp
+    sqv $v7[0], 0(t0)
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+0(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+0(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+2(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+2(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+4(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+4(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+6(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+6(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+8(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+8(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+10(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+10(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+12(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+12(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    addu t1, s0, s1
+    srav t1, t1, t3
+    srl a6, a5, 20
+    addu a6, a6, t1
+    andi a6, a6, 4095
+    srl t1, a6, 10
+    andi t1, t1, 1
+    subu t1, zero, t1
+    andi a7, a6, 1023
+    xor a7, a7, t1
+    subu a7, a7, t1
+    andi t1, t1, 1024
+    addu a7, a7, t1
+    sll a7, a7, 1
+    lh a7, sinq(a7)
+    srl t1, a6, 11
+    andi t1, t1, 1
+    subu t1, zero, t1
+    xor a7, a7, t1
+    subu a7, a7, t1
+    lh t9, famp+14(zero)
+    mtc2 a7, $v1[0]
+    mtc2 t9, $v2[0]
+    vmulf $v3, $v1, $v2[0]
+    mfc2 a7, $v3[0]
+    sh a7, opvv+14(zero)
+    addu s1, s0, zero
+    addu s0, a7, zero
+    addu a5, a5, t2
+    sw a5, 0(a3)
+    j fopnext
+    nop
+fmdone:
+    sh s0, 0(s3)
+    sh s1, 2(s3)
+    j voices
+    nop
+
+; ======================================================================
+;  THE REVERB (MuReverb): per side four combs, then two all-passes - on the
+;  vector unit, 8 samples at a time
+; ======================================================================
+;  A COMB's low-pass, lp = (y x 26214 + lp x 6554) / 32768, depends on the
+;  sample before, so 8 samples are its closed form: lp(j) = sum over k <= j
+;  of a d^(j-k) y(k), plus d^(j+1) lp(-1) (a = 0.8, d = 0.2) - 9 multiply-
+;  accumulates with constant vectors (RVK, in RDRAM after the all-pass
+;  lines, written by the CPU) instead of 8 dependent steps. Its input is 1548
+;  samples or more back, so nothing in a group of 8 waits on the group.
+;  An ALL-PASS reaches 244 samples or more back: 8 samples are independent.
+;  The sum of the combs (ACC) is kept as ACC / 8 in 16 bits.
+;  STAGE while the reverb runs: +0 a delay line's 64-sample window, +128
+;  ACC / 8 (64 halves), +256 RVK (9 vectors, then the constants vector),
+;  +512 one vector for the interleaving, +768 the block out (L R ...).
+reverb:
+    addiu a0, zero, stage+256
+    lw a1, task+16(zero)
+    addiu a1, a1, 8192
+    jal dmain
+    addiu a2, zero, 160
+    addiu t0, zero, stage+256
+    lqv $v10[0], 0(t0)
+    lqv $v11[0], 16(t0)
+    lqv $v12[0], 32(t0)
+    lqv $v13[0], 48(t0)
+    lqv $v14[0], 64(t0)
+    lqv $v15[0], 80(t0)
+    lqv $v16[0], 96(t0)
+    lqv $v17[0], 112(t0)
+    lqv $v18[0], 128(t0)
+    lqv $v19[0], 144(t0)
+    addiu s0, zero, 0
+rside:
+    addiu t0, zero, stage+128
+    sqv $v0[0], 0(t0)
+    sqv $v0[0], 16(t0)
+    sqv $v0[0], 32(t0)
+    sqv $v0[0], 48(t0)
+    sqv $v0[0], 64(t0)
+    sqv $v0[0], 80(t0)
+    sqv $v0[0], 96(t0)
+    sqv $v0[0], 112(t0)
+    addiu s1, zero, 0
+rcomb:
+    sll s2, s0, 2
+    addu s2, s2, s1
+    sll t0, s2, 1
+    lh s3, rvpos(t0)
+    lh a3, rvlen(t0)
+    lw t1, task+12(zero)
+    sll t2, s2, 12
+    addu s4, t1, t2
+    jal winin
+    nop
+; lp(-1) in lane 7 of v20
+    sll t0, s2, 1
+    lh t9, rvlp(t0)
+    mtc2 t9, $v20[14]
+    addiu a5, zero, 0
+rcs:
+    addiu t1, a5, stage
+    addiu t2, a5, mixs
+    lqv $v1[0], 0(t1)
+; ACC / 8 += y / 8
+    vmudm $v2, $v1, $v19[0]
+    lqv $v3[0], 128(t1)
+    vadd $v3, $v3, $v2
+    sqv $v3[0], 128(t1)
+; the 8 low-passes
+    vmulf $v4, $v18, $v20[7]
+    vmacf $v4, $v10, $v1[0]
+    vmacf $v4, $v11, $v1[1]
+    vmacf $v4, $v12, $v1[2]
+    vmacf $v4, $v13, $v1[3]
+    vmacf $v4, $v14, $v1[4]
+    vmacf $v4, $v15, $v1[5]
+    vmacf $v4, $v16, $v1[6]
+    vmacf $v4, $v17, $v1[7]
+    vor $v20, $v4, $v0
+; b = in + lp x 27525 / 32768, clamped (in = MIXS / 4)
+    lqv $v5[0], 0(t2)
+    vmudm $v5, $v5, $v19[1]
+    vmulf $v6, $v4, $v19[2]
+    vadd $v6, $v6, $v5
+    sqv $v6[0], 0(t1)
+    addiu a5, a5, 16
+    slti t0, a5, 128
+    bne t0, zero, rcs
+    nop
+    sll t0, s2, 1
+    mfc2 t9, $v20[14]
+    sh t9, rvlp(t0)
+    jal winout
+    nop
+    sll t0, s2, 1
+    addiu s3, s3, 64
+    slt t1, s3, a3
+    bne t1, zero, rcpos
+    nop
+    subu s3, s3, a3
+rcpos:
+    sh s3, rvpos(t0)
+    addiu s1, s1, 1
+    slti t0, s1, 4
+    bne t0, zero, rcomb
+    nop
+; the all-passes: b = W; y = b - ACC; W = ACC + b / 2, clamped; ACC = y
+    addiu s1, zero, 0
+rap:
+    sll s2, s0, 1
+    addu s2, s2, s1
+    sll t0, s2, 1
+    lh s3, appos(t0)
+    lh a3, aplen(t0)
+    lw t1, task+16(zero)
+    sll t2, s2, 11
+    addu s4, t1, t2
+    jal winin
+    nop
+    addiu a5, zero, 0
+ras:
+    addiu t1, a5, stage
+    lqv $v1[0], 0(t1)
+    lqv $v3[0], 128(t1)
+    vmudm $v2, $v1, $v19[0]
+    vmudm $v7, $v1, $v19[3]
+    vmudh $v8, $v3, $v19[5]
+    vmadh $v8, $v7, $v19[6]
+    vsub $v3, $v2, $v3
+    sqv $v8[0], 0(t1)
+    sqv $v3[0], 128(t1)
+    addiu a5, a5, 16
+    slti t0, a5, 128
+    bne t0, zero, ras
+    nop
+    jal winout
+    nop
+    sll t0, s2, 1
+    addiu s3, s3, 64
+    slt t1, s3, a3
+    bne t1, zero, rapos
+    nop
+    subu s3, s3, a3
+rapos:
+    sh s3, appos(t0)
+    addiu s1, s1, 1
+    slti t0, s1, 2
+    bne t0, zero, rap
+    nop
+; this side out: mix + ACC x 9830 / 32768 (ACC / 8 x 0.6 x 4), clamped, interleaved
+    addiu a5, zero, 0
+    sll a6, s0, 1
+    addiu a6, a6, stage+768
+rout:
+    addiu t1, a5, stage
+    lqv $v3[0], 128(t1)
+    vmulf $v4, $v3, $v19[4]
+    vadd $v4, $v4, $v4
+    vadd $v4, $v4, $v4
+    bne s0, zero, rright
+    nop
+    addiu t2, a5, mixl
+    j rsum
+    nop
+rright:
+    addiu t2, a5, mixr
+rsum:
+    lqv $v5[0], 0(t2)
+    vadd $v4, $v4, $v5
+    addiu t3, zero, stage+512
+    sqv $v4[0], 0(t3)
+    lh t0, stage+512(zero)
+    sh t0, 0(a6)
+    lh t0, stage+514(zero)
+    sh t0, 4(a6)
+    lh t0, stage+516(zero)
+    sh t0, 8(a6)
+    lh t0, stage+518(zero)
+    sh t0, 12(a6)
+    lh t0, stage+520(zero)
+    sh t0, 16(a6)
+    lh t0, stage+522(zero)
+    sh t0, 20(a6)
+    lh t0, stage+524(zero)
+    sh t0, 24(a6)
+    lh t0, stage+526(zero)
+    sh t0, 28(a6)
+    addiu a6, a6, 32
+    addiu a5, a5, 16
+    slti t0, a5, 128
+    bne t0, zero, rout
+    nop
+    addiu s0, s0, 1
+    slti t0, s0, 2
+    bne t0, zero, rside
+    nop
+; the block to the audio buffer
+    addiu a0, zero, stage+768
+    addu a1, fp, zero
+    jal dmaout
+    addiu a2, zero, 256
+    addiu fp, fp, 256
+    addiu s7, s7, 1
+    j block
+    nop
+finish:
+    sw s7, task+28(zero)
+    break
+    nop
+
+; ======================================================================
+;  A DELAY LINE'S 64-SAMPLE WINDOW: s4 the line (RDRAM), s3 the position,
+;  a3 the length (both multiples of 4, so every piece is 8-byte aligned).
+;  In at most two pieces when it wraps; winout sends the same bytes back.
+; ======================================================================
+winin:
+    addu k1, ra, zero
+    subu t0, a3, s3
+    slti t1, t0, 64
+    bne t1, zero, wi2
+    nop
+    addiu a0, zero, stage
+    sll t2, s3, 1
+    addu a1, s4, t2
+    jal dmain
+    addiu a2, zero, 128
+    jr k1
+    nop
+wi2:
+    addu k0, t0, zero
+    addiu a0, zero, stage
+    sll t2, s3, 1
+    addu a1, s4, t2
+    jal dmain
+    sll a2, k0, 1
+    sll t2, k0, 1
+    addiu a0, t2, stage
+    addu a1, s4, zero
+    addiu t3, zero, 64
+    subu t3, t3, k0
+    jal dmain
+    sll a2, t3, 1
+    jr k1
+    nop
+winout:
+    addu k1, ra, zero
+    subu t0, a3, s3
+    slti t1, t0, 64
+    bne t1, zero, wo2
+    nop
+    addiu a0, zero, stage
+    sll t2, s3, 1
+    addu a1, s4, t2
+    jal dmaout
+    addiu a2, zero, 128
+    jr k1
+    nop
+wo2:
+    addu k0, t0, zero
+    addiu a0, zero, stage
+    sll t2, s3, 1
+    addu a1, s4, t2
+    jal dmaout
+    sll a2, k0, 1
+    sll t2, k0, 1
+    addiu a0, t2, stage
+    addu a1, s4, zero
+    addiu t3, zero, 64
+    subu t3, t3, k0
+    jal dmaout
+    sll a2, t3, 1
+    jr k1
+    nop

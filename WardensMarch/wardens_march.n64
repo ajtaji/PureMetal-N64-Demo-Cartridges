@@ -1,0 +1,673 @@
+; ======================================================================
+;  wardens_march.n64 - THE WARDEN'S MARCH, a demo for the Nintendo 64
+; ======================================================================
+;  Written in PureMetal; compiled by PureMetal Forge's VR4300 back end:
+;      PureMetalForge.exe --compile wardens_march.n64 -o WardensMarch.bin
+;  writes WardensMarch.z64, a cartridge with the compiler's own boot code.
+;  Run it: N64.exe WardensMarch.z64
+;
+;  BEFORE THE FIRST BUILD, the two generated files beside this one (build.ps1):
+;    python make_assets.py                                -> wardens_assets.n64
+;    export_song.exe <WardensKey folder> theme theme.wkmu
+;  (export_song.pb: the Warden's Key main theme as data - the game's own
+;  tables, instruments and note rows - for the N64 to play itself.)
+;
+;  THE MUSIC IS PLAYED LIVE (wk_rsp.n64): the game's sequencer, voices, pitch
+;  and envelopes on the VR4300, every sample on the RSP (wk_synth.rsp).
+;
+;  On screen, every frame, all drawn by the RDP: a sky that changes colour
+;  with each bar of the music, a floor rushing towards the viewer, three
+;  copper bars bouncing to the beat, a starfield in depth, a Gouraud-lit
+;  torus turning in the middle and swelling on every beat, the title in
+;  waving letters, a sine scroller - and beside the torus, what is being
+;  heard (the voices sounding, each instrument's activity, the reverb) and
+;  what is being drawn.
+; ======================================================================
+XIncludeFile "Mips/Lib/n64.n64"
+XIncludeFile "wardens_assets.n64"
+XIncludeFile "version.n64"
+XIncludeFile "wk_rsp.n64"
+
+ASM
+  .cartfile "theme.wkmu"
+  .rspfile "wk_synth.rsp"
+  .rspfile "gfx_torus.rsp"
+EndASM
+
+#STARS = 56
+#TU = 16                                ; the torus: segments around
+#TV = 8                                 ; and around the tube
+#TVERTS = #TU * #TV
+
+Global frame.i, beat.i, pulse.i, bar.i, rowNow.i
+Global rnd.i = 1234567
+
+Global Dim starX.i(#STARS)
+Global Dim starY.i(#STARS)
+Global Dim starZ.i(#STARS)
+
+; the torus: its corners and their normals at rest, then turned and projected
+Global Dim tX.i(#TVERTS)
+Global Dim tY.i(#TVERTS)
+Global Dim tZ.i(#TVERTS)
+Global Dim nX.i(#TVERTS)
+Global Dim nY.i(#TVERTS)
+Global Dim nZ.i(#TVERTS)
+Global Dim pX.i(#TVERTS)
+Global Dim pY.i(#TVERTS)
+Global Dim pZ.i(#TVERTS)
+Global Dim pC.i(#TVERTS)
+Global Dim qOrder.i(#TVERTS)
+Global Dim qDepth.i(#TVERTS)
+
+; ----------------------------------------------------------------------
+Procedure.i Sin14(a.i)                  ; 256 steps a turn, 16384 = 1
+  ProcedureReturn PeekW(?SinTab + ((a & 255) * 2))
+EndProcedure
+
+Procedure.i Cos14(a.i)
+  ProcedureReturn PeekW(?SinTab + (((a + 64) & 255) * 2))
+EndProcedure
+
+Procedure.i Random16()
+  rnd = (rnd * 1103515245 + 12345) & $7FFFFFFF
+  ProcedureReturn (rnd >> 8) & $FFFF
+EndProcedure
+
+; $RRGGBB from a hue 0..255 and a brightness 0..255
+Procedure.i Hue(h.i, v.i)
+  Protected r.i, g.i, b.i, k.i
+  h = h & 255
+  k = (h % 43) * 6
+  Select h / 43
+    Case 0 : r = 255 : g = k : b = 0
+    Case 1 : r = 255 - k : g = 255 : b = 0
+    Case 2 : r = 0 : g = 255 : b = k
+    Case 3 : r = 0 : g = 255 - k : b = 255
+    Case 4 : r = k : g = 0 : b = 255
+    Default : r = 255 : g = 0 : b = 255 - k
+  EndSelect
+  ProcedureReturn (((r * v) >> 8) << 16) | (((g * v) >> 8) << 8) | ((b * v) >> 8)
+EndProcedure
+
+Procedure.i Rgb16Of(c.i)
+  ProcedureReturn N64Rgb16((c >> 16) & 255, (c >> 8) & 255, c & 255)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE MUSIC'S CLOCK, from the sample being heard: a row is 2880000 /
+;  (tempo x speed) samples, a beat four rows, a bar 16.
+; ----------------------------------------------------------------------
+Procedure MusicClock()
+  Protected ticks.i
+  ticks = WsHeard() * wkTempo * wkSpeed
+  rowNow = ticks / 2880000
+  beat = rowNow / 4
+  bar = rowNow / 16
+  pulse = 255 - (((ticks % (4 * 2880000)) * 256) / (4 * 2880000))
+  pulse = (pulse * pulse) >> 8
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE BACKGROUND: the sky, and a floor of bands rushing in
+; ----------------------------------------------------------------------
+Procedure DrawSky()
+  Protected h.i = bar * 23
+  RdpShadeMode()
+  RdpShadeRect(0, 0, 319, 159, Hue(h + 160, 40), Hue(h + 140, 150))
+  RdpShadeRect(0, 160, 319, 239, Hue(h + 100, 30), Hue(h + 100, 110))
+EndProcedure
+
+Procedure DrawFloor()
+  Protected i.i, z.i, y0.i, y1.i, c.i
+  RdpFillMode()
+  For i = 0 To 13
+    z = (i * 32) + 32 - ((frame * 4) % 64)
+    If z > 8
+      y0 = 160 + (2400 / z)
+      y1 = 160 + (2400 / (z + 16))
+      If y0 > 239 : y0 = 239 : EndIf
+      c = 60 + (6000 / z)
+      If c > 255 : c = 255 : EndIf
+      RdpFillColor(Rgb16Of(Hue(bar * 23 + 100, c)))
+      RdpFillRect(0, y1, 319, y1 + 1 + (y0 - y1) / 3)
+    EndIf
+  Next
+EndProcedure
+
+; three bars, each lit through its middle, bouncing; brighter on the beat
+Procedure DrawCopper()
+  Protected i.i, y.i, c.i, v.i
+  RdpShadeMode()
+  For i = 0 To 2
+    y = 80 + ((Sin14((frame * 2) + (i * 40)) * (40 + (pulse >> 4))) >> 14)
+    v = 140 + (pulse >> 1)
+    If v > 255 : v = 255 : EndIf
+    c = Hue((frame) + (i * 85), v)
+    RdpShadeRect(0, y, 319, y + 5, Hue(i * 85, 20), c)
+    RdpShadeRect(0, y + 6, 319, y + 11, c, Hue(i * 85, 20))
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE STARS: points in depth, coming at the viewer
+; ----------------------------------------------------------------------
+Procedure InitStars()
+  Protected i.i
+  For i = 0 To #STARS - 1
+    starX(i) = (Random16() % 2048) - 1024
+    starY(i) = (Random16() % 1400) - 900
+    starZ(i) = 16 + (Random16() % 1000)
+  Next
+EndProcedure
+
+Procedure DrawStars()
+  Protected i.i, sx.i, sy.i, s.i, c.i
+  RdpFillMode()
+  For i = 0 To #STARS - 1
+    starZ(i) = starZ(i) - (6 + (pulse >> 5))
+    If starZ(i) < 16
+      starZ(i) = 1000
+      starX(i) = (Random16() % 2048) - 1024
+      starY(i) = (Random16() % 1400) - 900
+    EndIf
+    sx = 160 + ((starX(i) * 128) / starZ(i))
+    sy = 100 + ((starY(i) * 128) / starZ(i))
+    s = 1 + (300 / starZ(i))
+    If s > 4 : s = 4 : EndIf
+    c = 255 - (starZ(i) >> 2)
+    If c < 40 : c = 40 : EndIf
+    RdpFillColor(N64Rgb16(c, c, c))
+    RdpFillRect(sx, sy, sx + s - 1, sy + s - 1)
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE TORUS: Gouraud, each corner lit by its own normal
+; ----------------------------------------------------------------------
+Procedure InitTorus()
+  Protected i.i, j.i, k.i, cu.i, su.i, cv.i, sv.i, rr.i
+  For i = 0 To #TU - 1
+    cu = Cos14((i * 256) / #TU) : su = Sin14((i * 256) / #TU)
+    For j = 0 To #TV - 1
+      cv = Cos14((j * 256) / #TV) : sv = Sin14((j * 256) / #TV)
+      k = (i * #TV) + j
+      rr = 70 + ((26 * cv) >> 14)
+      tX(k) = (rr * cu) >> 14
+      tY(k) = (rr * su) >> 14
+      tZ(k) = (26 * sv) >> 14
+      nX(k) = (cv * cu) >> 14
+      nY(k) = (cv * su) >> 14
+      nZ(k) = sv
+    Next
+  Next
+EndProcedure
+
+; spin in its own plane by c, tilt about X by a, then about Y by b; the
+; result in rotX/rotY/rotZ. The spin is what turns; the tilts only rock it,
+; so the ring always shows its hole.
+Global rotX.i, rotY.i, rotZ.i, ca.i, sa.i, cb.i, sb.i, cc.i, sc.i
+Procedure Turn(x.i, y.i, z.i)
+  Protected x0.i, y0.i, y1.i, z1.i
+  x0 = ((x * cc) - (y * sc)) >> 14
+  y0 = ((x * sc) + (y * cc)) >> 14
+  y1 = ((y0 * ca) - (z * sa)) >> 14
+  z1 = ((y0 * sa) + (z * ca)) >> 14
+  rotX = ((x0 * cb) + (z1 * sb)) >> 14
+  rotY = y1
+  rotZ = ((z1 * cb) - (x0 * sb)) >> 14
+EndProcedure
+
+Procedure DrawTorusCpu()
+  Protected k.i, i.i, j.i, a.i, b.i, c.i, d.i, n.i, t.i, m.i, lit.i, scale.i, dz.i, area.i, tilt.i
+  cc = Cos14(frame) : sc = Sin14(frame)
+  tilt = 28 + ((Sin14(frame / 2) * 22) >> 14)
+  ca = Cos14(tilt) : sa = Sin14(tilt)
+  tilt = (Sin14((frame * 2) / 3) * 30) >> 14
+  cb = Cos14(tilt) : sb = Sin14(tilt)
+  scale = 256 + (pulse >> 2)
+  For k = 0 To #TVERTS - 1
+    Turn(tX(k), tY(k), tZ(k))
+    dz = rotZ + 260
+    pX(k) = 160 + (((rotX * scale) >> 8) * 220) / dz
+    pY(k) = 108 + (((rotY * scale) >> 8) * 220) / dz
+    pZ(k) = rotZ
+    Turn(nX(k), nY(k), nZ(k))
+    ; the light comes from the viewer, up and to the left
+    lit = ((-rotZ * 10) - (rotY * 5) - (rotX * 4)) / 12
+    If lit < 0 : lit = 0 : EndIf
+    lit = 50 + ((lit * 205) >> 14)
+    If lit > 255 : lit = 255 : EndIf
+    pC(k) = Hue(((k / #TV) * 16) + (frame >> 1), lit)
+  Next
+  ; the quads, far ones first
+  n = 0
+  For i = 0 To #TU - 1
+    For j = 0 To #TV - 1
+      a = (i * #TV) + j
+      b = (((i + 1) % #TU) * #TV) + j
+      c = (((i + 1) % #TU) * #TV) + ((j + 1) % #TV)
+      d = (i * #TV) + ((j + 1) % #TV)
+      area = ((pX(b) - pX(a)) * (pY(d) - pY(a))) - ((pX(d) - pX(a)) * (pY(b) - pY(a)))
+      If area < 0
+        qOrder(n) = a
+        qDepth(n) = pZ(a) + pZ(b) + pZ(c) + pZ(d)
+        n = n + 1
+      EndIf
+    Next
+  Next
+  For i = 1 To n - 1
+    t = qOrder(i) : m = qDepth(i) : j = i - 1
+    While j >= 0 And qDepth(j) < m
+      qOrder(j + 1) = qOrder(j) : qDepth(j + 1) = qDepth(j)
+      j = j - 1
+    Wend
+    qOrder(j + 1) = t : qDepth(j + 1) = m
+  Next
+  RdpShadeMode()
+  For k = 0 To n - 1
+    a = qOrder(k)
+    i = a / #TV : j = a % #TV
+    b = (((i + 1) % #TU) * #TV) + j
+    c = (((i + 1) % #TU) * #TV) + ((j + 1) % #TV)
+    d = (i * #TV) + ((j + 1) % #TV)
+    RdpShadeTriangle(pX(a), pY(a), pC(a), pX(b), pY(b), pC(b), pX(c), pY(c), pC(c))
+    RdpShadeTriangle(pX(a), pY(a), pC(a), pX(c), pY(c), pC(c), pX(d), pY(d), pC(d))
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE TORUS ON THE RSP (gfx_torus.rsp): the CPU's part is the matrix and
+;  the hues; the RSP turns, lights, culls and sorts it and sets up its
+;  triangles as RDP commands, which the CPU copies into the frame's list. GfxRequest asks for this frame's torus; the RSP
+;  does it between two pieces of music (GfxService, from the idle hook);
+;  DrawTorus draws the newest one finished - normally the previous frame's,
+;  a frame behind the rest, as the picture on screen already is.
+;  DrawTorusCpu above is the same torus done by the CPU, sample for sample
+;  what the RSP is told to do; it draws the first frame, before the RSP
+;  has answered.
+; ----------------------------------------------------------------------
+#GFX_OWNER = 2
+#GFX_CODE = $A0357000                   ; the program, kept in RDRAM
+#GFX_IN = $A0226000                     ; its input: the torus at rest and the reciprocals (2 KB)
+#GFX_OUT0 = $A0226800                   ; its answers, two in turn (8 + 128 triangles x 96 bytes)
+#GFX_OUT1 = $A022A000
+Global gfxPending.i, gfxLaunched.i, gfxOut.i, gfxReady.i = -1, gK.i
+Global Dim gM.i(9)
+Global Dim gHue.i(48)
+
+; The torus at rest (InitTorus's) and the reciprocal table, into RDRAM once.
+Procedure.i GfxStart(rsp.i)
+  Protected k.i, t.i
+  If N64RspCache(rsp, #GFX_CODE) = 0 : ProcedureReturn 0 : EndIf
+  For k = 0 To #TVERTS - 1
+    PokeW(#GFX_IN + (k * 2), tX(k) * 64)
+    PokeW(#GFX_IN + 256 + (k * 2), tY(k) * 64)
+    PokeW(#GFX_IN + 512 + (k * 2), tZ(k) * 64)
+    PokeW(#GFX_IN + 768 + (k * 2), nX(k))
+    PokeW(#GFX_IN + 1024 + (k * 2), nY(k))
+    PokeW(#GFX_IN + 1280 + (k * 2), nZ(k))
+  Next
+  For k = 0 To 255
+    t = ((1 << 23) + ((k + 128) / 2)) / (k + 128) : If t > 65535 : t = 65535 : EndIf
+    PokeW(#GFX_IN + 1536 + (k * 2), t)
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GfxQ15(v.i)
+  v = v * 2
+  If v > 32767 : v = 32767 : EndIf
+  If v < -32767 : v = -32767 : EndIf
+  ProcedureReturn v
+EndProcedure
+
+; This frame's torus: Turn's three turns as one matrix (Q14, then Q15),
+; the projection's scale, the rings' hues.
+; GFX CHECK (2026-11-01): 1 makes every torus request a function of its own count
+; (not of the frame), and prints each answer's count and checksum to the ISViewer
+; - "G <task> <bytes> <sum> <xor>" - so two emulators' RSPs can be compared task for
+; task (tools/n64_gfx_check.sh). 0 for the demo.
+#GFX_CHECK = 0
+Global gfxReqN.i, gfxDrawN.i, isvLen.i
+Global Dim isvLine.b(96)
+Procedure IsvPut(c.i)
+  If isvLen < 90 : isvLine(isvLen) = c : isvLen = isvLen + 1 : EndIf
+EndProcedure
+Procedure IsvHex(v.i)
+  Protected k.i, d.i
+  For k = 7 To 0 Step -1
+    d = (v >> (k * 4)) & 15
+    If d > 9 : IsvPut(d + 55) : Else : IsvPut(d + 48) : EndIf
+  Next
+EndProcedure
+Procedure IsvFlush()
+  Protected k.i, w.i
+  IsvPut(10)
+  For k = 0 To isvLen - 1 Step 4
+    w = ((isvLine(k) & 255) << 24) | ((isvLine(k + 1) & 255) << 16) | ((isvLine(k + 2) & 255) << 8) | (isvLine(k + 3) & 255)
+    PokeL($B3FF0020 + k, w)
+  Next
+  PokeL($B3FF0014, isvLen)
+  isvLen = 0
+EndProcedure
+
+; GFX CHECK: the second task's DMEM, 32 bytes a line, "D <address> <hex>"
+Global gfxDoneN.i
+Procedure GfxCheckDump()
+  Protected a.i, k.i, w.i
+  gfxDoneN = gfxDoneN + 1
+  If gfxDoneN <> 2 : ProcedureReturn : EndIf
+  For a = 0 To 2928 - 32 Step 32
+    IsvPut(68) : IsvPut(32) : IsvHex(a) : IsvPut(32)
+    For k = 0 To 28 Step 4
+      IsvHex(PeekL($A4000000 + a + k))
+    Next
+    IsvFlush()
+  Next
+EndProcedure
+
+Procedure GfxRequest()
+  Protected tilt.i, ssa.i, k.i, c.i, fr.i, pu.i
+  If gfxPending : ProcedureReturn : EndIf
+  fr = frame : pu = pulse
+  If #GFX_CHECK : fr = gfxReqN * 5 : pu = 0 : EndIf
+  gfxReqN = gfxReqN + 1
+  cc = Cos14(fr) : sc = Sin14(fr)
+  tilt = 28 + ((Sin14(fr / 2) * 22) >> 14)
+  ca = Cos14(tilt) : sa = Sin14(tilt)
+  tilt = (Sin14((fr * 2) / 3) * 30) >> 14
+  cb = Cos14(tilt) : sb = Sin14(tilt)
+  ssa = (sb * sa) >> 14
+  gM(0) = GfxQ15(((cb * cc) >> 14) + ((ssa * sc) >> 14))
+  gM(1) = GfxQ15(((ssa * cc) >> 14) - ((cb * sc) >> 14))
+  gM(2) = GfxQ15((sb * ca) >> 14)
+  gM(3) = GfxQ15((ca * sc) >> 14)
+  gM(4) = GfxQ15((ca * cc) >> 14)
+  gM(5) = GfxQ15(-sa)
+  ssa = (cb * sa) >> 14
+  gM(6) = GfxQ15(((ssa * sc) >> 14) - ((sb * cc) >> 14))
+  gM(7) = GfxQ15(((ssa * cc) >> 14) + ((sb * sc) >> 14))
+  gM(8) = GfxQ15((cb * ca) >> 14)
+  gK = ((256 + (pu >> 2)) * 220) / 256
+  For k = 0 To #TU - 1
+    c = Hue((k * 16) + (fr >> 1), 256)
+    gHue(k * 3) = ((c >> 16) & 255) * 256
+    gHue((k * 3) + 1) = ((c >> 8) & 255) * 256
+    gHue((k * 3) + 2) = (c & 255) * 256
+  Next
+  gfxPending = 1 : gfxLaunched = 0
+EndProcedure
+
+; The RSP's side: an answer collected, a request started when the RSP is free.
+; Called ONLY from the idle hook, which polls without pause: the music is
+; asked to give the RSP up (N64RspWanted), the torus runs, and the music is
+; started again (WsService) within microseconds - asked from anywhere else,
+; the RSP could sit idle until the CPU next looked.
+Procedure GfxService()
+  Protected k.i, out.i
+  If gfxLaunched
+    If N64RspDone()
+      If #GFX_CHECK : GfxCheckDump() : EndIf
+      gfxReady = gfxOut
+      gfxPending = 0 : gfxLaunched = 0 : N64RspOwner = 0 : N64RspWanted = 0
+    EndIf
+    ProcedureReturn
+  EndIf
+  If gfxPending = 0 : ProcedureReturn : EndIf
+  N64RspWanted = 1
+  If N64RspOwner <> 0 : ProcedureReturn : EndIf
+  gfxOut = 0 : If gfxReady = 0 : gfxOut = 1 : EndIf
+  out = #GFX_OUT0 : If gfxOut : out = #GFX_OUT1 : EndIf
+  N64RspUse(#GFX_CODE, #GFX_OWNER)
+  PokeL(#N64_DMEM + 0, #GFX_IN & $FFFFFF)
+  PokeL(#N64_DMEM + 4, out & $FFFFFF)
+  ; DMEM IS WRITTEN IN WORDS (2026-11-01). The RCP takes a 16-bit store from the
+  ; CPU as a 32-bit write of the whole register at the word's address, on a
+  ; console and in ares (the matrix arrived as FFFF F46C 0000 0BDC ..: random
+  ; holes in the torus); Forge's emulator did the same until it was taught.
+  For k = 0 To 3 : PokeL(#N64_DMEM + 32 + (k * 4), ((gM(k * 2) & $FFFF) << 16) | (gM((k * 2) + 1) & $FFFF)) : Next
+  PokeL(#N64_DMEM + 48, ((gM(8) & $FFFF) << 16) | (gK & $FFFF))
+  For k = 0 To #TU - 1
+    PokeL(#N64_DMEM + 64 + (k * 8), ((gHue(k * 3) & $FFFF) << 16) | (gHue((k * 3) + 1) & $FFFF))
+    PokeL(#N64_DMEM + 68 + (k * 8), (gHue((k * 3) + 2) & $FFFF) << 16)
+  Next
+  N64RspRun()
+  gfxLaunched = 1
+EndProcedure
+
+; The program's idle hook: the RSP's two jobs.
+Procedure DemoIdle()
+  GfxService()
+  WsService()
+EndProcedure
+
+; The newest torus the RSP has finished: its triangles are RDP commands
+; already, copied into the frame's list as they are.
+Procedure DrawTorus()
+  Protected p.i, n.i, k.i, d.i
+  If gfxReady < 0 : DrawTorusCpu() : ProcedureReturn : EndIf
+  p = #GFX_OUT0 : If gfxReady : p = #GFX_OUT1 : EndIf
+  n = PeekL(p) * 96 : p = p + 8
+  RdpShadeMode()
+  d = N64RdpPtr
+  If d + n >= N64RdpListEnd : ProcedureReturn : EndIf
+  For k = 0 To n - 8 Step 8
+    PokeI(d + k, PeekI(p + k))
+  Next
+  N64RdpPtr = d + n
+  If #GFX_CHECK And gfxDrawN < 40
+    Protected sum.i, x.i
+    For k = 0 To n - 4 Step 4
+      sum = (sum + PeekL(p + k)) & $FFFFFFFF : x = (x ! PeekL(p + k)) & $FFFFFFFF
+    Next
+    IsvPut(71) : IsvPut(32) : IsvHex(gfxDrawN) : IsvPut(32) : IsvHex(n) : IsvPut(32) : IsvHex(sum) : IsvPut(32) : IsvHex(x) : IsvFlush()
+    gfxDrawN = gfxDrawN + 1
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TEXT: a 5 x 7 glyph, `s` pixels a dot, in the current fill colour
+; ----------------------------------------------------------------------
+Procedure DrawGlyph(ch.i, x.i, y.i, s.i)
+  Protected r.i, bits.i, col.i, g.i, run.i
+  If ch < 32 Or ch > 95 : ProcedureReturn : EndIf
+  If x > #N64_W Or x < -6 * s : ProcedureReturn : EndIf
+  g = ?Font + ((ch - 32) * 8)
+  For r = 0 To 6
+    bits = PeekA(g + r)
+    col = 0
+    While bits <> 0
+      If bits & $80
+        ; a run of dots is one rectangle
+        run = 0
+        While bits & $80
+          run = run + 1 : bits = (bits << 1) & 255
+        Wend
+        RdpFillRect(x + (col * s), y + (r * s), x + ((col + run) * s) - 1, y + (r * s) + s - 1)
+        col = col + run
+      Else
+        bits = (bits << 1) & 255 : col = col + 1
+      EndIf
+    Wend
+  Next
+EndProcedure
+
+Procedure DrawTitle()
+  Protected i.i, c.i, x.i, y.i, drop.i
+  RdpFillMode()
+  drop = 0
+  If frame < 120 : drop = (120 - frame) * 2 : EndIf
+  For i = 0 To #TITLE_LEN - 1
+    c = PeekA(?TitleText + i)
+    x = 160 - ((#TITLE_LEN * 12) / 2) + (i * 12)
+    y = 10 - drop + ((Sin14((frame * 4) + (i * 18)) * (3 + (pulse >> 5))) >> 14)
+    RdpFillColor(N64Rgb16(0, 0, 0))
+    DrawGlyph(c, x + 1, y + 1, 2)
+    RdpFillColor(Rgb16Of(Hue((frame * 3) + (i * 14), 255)))
+    DrawGlyph(c, x, y, 2)
+  Next
+EndProcedure
+
+; The shadows first, all of them, then the letters: a letter's shadow must
+; never land on the letter before it.
+Procedure DrawScroller()
+  Protected i.i, c.i, x.i, y.i, first.i, sub.i, pos.i, pass.i
+  RdpFillMode()
+  pos = frame * 2
+  first = pos / 18 : sub = pos % 18
+  RdpFillColor(N64Rgb16(0, 0, 0))
+  For pass = 0 To 1
+    For i = 0 To 18
+      c = PeekA(?ScrollText + ((first + i) % #SCROLL_LEN))
+      x = (i * 18) - sub
+      y = 204 + ((Sin14(x + (frame * 4)) * 7) >> 14)
+      If pass = 0
+        DrawGlyph(c, x + 2, y + 2, 3)
+      Else
+        RdpFillColor(Rgb16Of(Hue((x >> 1) + (frame * 2), 255)))
+        DrawGlyph(c, x, y, 3)
+      EndIf
+    Next
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE HUD: what is heard on the left, what is drawn on the right, at one
+;  pixel a dot (6 pixels a character)
+; ----------------------------------------------------------------------
+Procedure.i DrawText(t.i, x.i, y.i)
+  Protected c.i = PeekA(t)
+  While c <> 0
+    DrawGlyph(c, x, y, 1)
+    x = x + 6 : t = t + 1 : c = PeekA(t)
+  Wend
+  ProcedureReturn x
+EndProcedure
+
+Procedure DrawVersion(x.i, y.i)
+  DrawGlyph(86, x, y, 1) : x = x + 6                 ; "V"
+  x = DrawNum(#DEMO_MAJOR, x, y) : DrawGlyph(46, x, y, 1) : x = x + 6
+  x = DrawNum(#DEMO_MINOR, x, y) : DrawGlyph(46, x, y, 1) : x = x + 6
+  DrawNum(#DEMO_BUILD, x, y)
+EndProcedure
+
+Procedure.i DrawNum(n.i, x.i, y.i)
+  Protected d.i = 1
+  While d * 10 <= n : d = d * 10 : Wend
+  While d > 0
+    DrawGlyph(48 + ((n / d) % 10), x, y, 1)
+    x = x + 6 : d = d / 10
+  Wend
+  ProcedureReturn x
+EndProcedure
+
+; THE HUD'S WORDS CHANGE ONLY WITH THE CAPTION (every four seconds), so they
+; are drawn once into a command block of their own (HudRecord: the RDP
+; commands DrawGlyph makes, written to #HUD_BLOCK instead of the frame's
+; list) and that block is copied into every frame's list (HudReplay) - a
+; copy of a few thousand words where drawing the glyphs again cost
+; thousands of procedure calls. Only the numbers and the bars are drawn
+; each frame.
+#HUD_BLOCK = $8023C000                  ; cached RDRAM after the reverb's lines, 64 KB
+Global hudLen.i, hudCap.i = -1
+
+Procedure HudRecord(cap.i)
+  Protected keepPtr.i = N64RdpPtr, keepEnd.i = N64RdpListEnd, i.i, k.i, t.i
+  N64RdpPtr = #HUD_BLOCK : N64RdpListEnd = #HUD_BLOCK + $FF00
+  RdpFillMode()
+  ; the backing panels
+  RdpFillColor(N64Rgb16(8, 8, 24))
+  RdpFillRect(2, 32, 69, 175)
+  RdpFillRect(248, 32, 319, 101)
+  ; what is heard
+  RdpFillColor(N64Rgb16(255, 220, 90))
+  DrawText(?HudHear1, 6, 36)
+  DrawText(?HudRev1, 6, 142)
+  DrawText(?HudSee, 252, 36)
+  RdpFillColor(N64Rgb16(220, 220, 220))
+  DrawText(?HudHear2, 6, 46)
+  DrawText(?HudHear3, 6, 55)
+  DrawText(?HudVoices, 6, 69)
+  DrawText(?HudRev2, 6, 152)
+  DrawText(?HudRev3, 6, 161)
+  ; what is drawn: the caption
+  t = ?CapText + (cap * #CAP_W)
+  For i = 0 To 2
+    For k = 0 To 11
+      DrawGlyph(PeekA(t + (i * 12) + k), 252 + (k * 6), 50 + (i * 10), 1)
+    Next
+  Next
+  RdpFillColor(N64Rgb16(255, 110, 230))
+  DrawText(?HudFm, 6, 88)
+  RdpFillColor(N64Rgb16(110, 220, 255))
+  DrawText(?HudWave, 6, 97)
+  ; and who made it
+  RdpFillColor(N64Rgb16(255, 255, 255))
+  DrawText(?HudMade, 160 - 99, 232)
+  ; and which build this is (version.n64), bottom right
+  DrawVersion(272, 232)
+  hudLen = N64RdpPtr - #HUD_BLOCK
+  N64RdpPtr = keepPtr : N64RdpListEnd = keepEnd
+  hudCap = cap
+EndProcedure
+
+Procedure HudReplay()
+  Protected i.i
+  If N64RdpPtr + hudLen >= N64RdpListEnd : ProcedureReturn : EndIf
+  For i = 0 To hudLen - 8 Step 8
+    PokeI(N64RdpPtr + i, PeekI(#HUD_BLOCK + i))
+  Next
+  N64RdpPtr = N64RdpPtr + hudLen
+EndProcedure
+
+Procedure DrawHud()
+  Protected x.i, i.i, h.i, k.i, cap.i
+  cap = (frame / 240) % #CAP_N
+  If cap <> hudCap : HudRecord(cap) : EndIf
+  HudReplay()
+  ; the numbers
+  RdpFillColor(N64Rgb16(220, 220, 220))
+  x = DrawNum(wkActive, 6, 78) : DrawText(?HudOf, x, 78)
+  RdpFillColor(N64Rgb16(255, 110, 230))
+  DrawNum(wkActiveFm, 24, 88)
+  RdpFillColor(N64Rgb16(110, 220, 255))
+  DrawNum(wkActiveWave, 36, 97)
+  ; each instrument: a bar as tall as its voices, coloured by its kind
+  For i = 0 To wkNIns - 1
+    k = iKind(i) : h = wkInsActive(i) * 5 : If h > 25 : h = 25 : EndIf
+    If k = 3 : RdpFillColor(N64Rgb16(255, 110, 230)) : ElseIf k = 2 : RdpFillColor(N64Rgb16(230, 230, 230)) : Else : RdpFillColor(N64Rgb16(110, 220, 255)) : EndIf
+    RdpFillRect(6 + (i * 5), 134 - h, 9 + (i * 5), 134)
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+Procedure Main()
+  N64VideoInit()
+  WsStart(N64CartFile(0), N64CartFile(1))
+  InitStars()
+  InitTorus()
+  GfxStart(N64CartFile(2))
+  N64IdleHook = @DemoIdle                 ; the RSP's work, while the CPU waits for the RDP or the beam
+  Repeat
+    WsPump()
+    MusicClock()
+    GfxRequest()
+    RdpBegin()
+    RdpTarget(N64FbDraw)
+    DrawSky()
+    DrawFloor()
+    DrawCopper()
+    DrawStars()
+    WsPump()
+    DrawTorus()
+    DrawTitle()
+    DrawScroller()
+    WsPump()
+    DrawHud()
+    N64Present()
+    frame = frame + 1
+  ForEver
+EndProcedure
+
+Main()

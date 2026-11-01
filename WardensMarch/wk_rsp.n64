@@ -1,0 +1,574 @@
+; ======================================================================
+;  wk_rsp.n64 - the Warden's Key music engine with its synthesis on the RSP
+; ======================================================================
+;  The CPU half. The game's sequencer and voices are wk_player.n64's (the
+;  engine's own code ported to PureMetal); here they run at the engine's
+;  32-sample control rate, and the per-sample work - oscillators, FM, gains,
+;  pan, the reverb - is wk_synth.rsp's, on the RSP, while the CPU draws.
+;
+;  ONE AUDIO BUFFER = #WS_BLOCKS blocks of 64 samples (1536 frames, 32 ms at
+;  48 kHz). WsPump: when the RSP has finished a buffer it goes to the audio
+;  interface, the next buffer's records are written, and the RSP is started
+;  on it - then WsPump returns at once.
+;
+;  THE CONTROL RATE. Per voice and 32 samples the CPU computes the pitch
+;  (the engine's own sweep and vibrato, as it does every 32 samples) and the
+;  envelopes - in closed form for a whole 32 (export_song.pb computes the
+;  factors from the engine's per-sample recurrences), by the engine's own
+;  per-sample steps for a part. The RSP moves gains and FM amplitudes
+;  linearly between those points.
+;
+;  WHAT IS PRECOMPUTED. Everything an instrument fixes is worked out once,
+;  in WsPrep (the i* and p* arrays), and everything a note fixes once at its
+;  first block (vGk): the per-block work is the envelopes, the pitch when it
+;  moves (vPUntil: the pitch is reused while it cannot change) and the
+;  records.
+; ======================================================================
+XIncludeFile "wk_player.n64"
+
+#WS_BLOCKS = 24
+#WS_FRAMES = #WS_BLOCKS * 64
+#WS_REC = $A0360000                  ; the records: two areas of up to 24 x 33 x 160 bytes (uncached: the RSP reads RDRAM)
+#WS_REC2 = $A02B0000                 ; (after frame buffer 1)
+#WS_STEP = 6                         ; blocks built a WsPump
+#WS_OWNER = 1                        ; the music's number on the shared RSP (N64RspOwner)
+#WS_CODE = $A0354000                 ; the synthesiser's code and data, kept in RDRAM (8 KB + 32)
+#WS_STATE = $A0356100                ; its state between tasks
+#WS_STATE_DMEM = 32
+#WS_STATE_LEN = 176
+#WS_COMBS = $A0230000                ; the reverb's delay lines, 8 x 4 KB then 4 x 2 KB, after frame buffer 0
+#WS_APS = $A0238000
+#WS_RVK = #WS_APS + $2000            ; the reverb's constants (wk_synth.rsp reads them after the all-pass lines)
+#WS_TASK = 0                         ; wk_synth.rsp's "task" in DMEM; its sine table follows at 32
+#WS_SINQ = 208
+#WS_M25400 = 1385211500              ; x / 25400 = (x * M) >> 45, exact for 0 <= x < 2^30
+#WS_FOREVER = $7FFFFFFFFFFF
+Global wsTab512.i, wsBuf.i, wsBusy.i, wsOn.i
+Global Dim vStartIn.i(#WK_VOICES)    ; the sample, in this block, its note began (0: at or before the block)
+Global Dim vGk.i(#WK_VOICES)         ; wave: volume x velocity; FM: the voice's gain (Q15)
+Global Dim vPInc.i(#WK_VOICES)       ; the pitch last computed, still right while vT < vPUntil
+Global Dim vPUntil.i(#WK_VOICES)
+
+; an instrument's constants (by instrument)
+Global Dim iKind.i(32)               ; 1 wave, 2 noise, 3 FM
+Global Dim iGL.i(32)
+Global Dim iGR.i(32)
+Global Dim iSend.i(32)               ; Q15
+Global Dim iFbSh.i(32)               ; FM feedback: 9 - fb, 0 for none
+Global Dim iNib.i(32)                ; FM output slots
+Global Dim iSweepEnd.i(32)           ; the sample the pitch sweep ends (0: none)
+Global Dim iVib.i(32)
+Global Dim iVibD.i(32)
+Global Dim iAttInc.i(32)             ; wave envelope: the attack step (0: instant)
+Global Dim iTgt.i(32)
+Global Dim iDDiv.i(32)               ; d x 48 (0: none)
+Global Dim iDF.i(32)
+Global Dim iRDiv.i(32)
+Global Dim iRF.i(32)
+Global Dim iRC.i(32)
+; an FM operator's constants (by instrument x 4 + operator)
+Global Dim pTl8.i(128)
+Global Dim pMulK.i(128)
+Global Dim pSrcA.i(128)
+Global Dim pSrcB.i(128)
+Global Dim pAK.i(128)
+Global Dim pASub.i(128)
+Global Dim pDI.i(128)
+Global Dim pSI.i(128)
+Global Dim pRI.i(128)
+Global Dim pSlA.i(128)
+Global Dim pAF.i(128)
+Global Dim pAC.i(128)
+
+; ----------------------------------------------------------------------
+;  the instruments' constants
+; ----------------------------------------------------------------------
+Procedure WsPrep()
+  Protected n.i, b.i, o.i, ob.i, q.i, alg.i, sl.i
+  For n = 0 To wkNIns - 1
+    b = n * 64
+    iKind(n) = 1
+    If wkI(b + #WI_FM) : iKind(n) = 3 : ElseIf wkI(b + #WI_WAVE) = 7 : iKind(n) = 2 : EndIf
+    iGL(n) = wkI(b + #WI_GL) : If iGL(n) > 32767 : iGL(n) = 32767 : EndIf
+    iGR(n) = wkI(b + #WI_GR) : If iGR(n) > 32767 : iGR(n) = 32767 : EndIf
+    iSend(n) = (wkI(b + #WI_SEND) * 32768) / 100 : If iSend(n) > 32767 : iSend(n) = 32767 : EndIf
+    iSweepEnd(n) = 0
+    If wkI(b + #WI_SWEEP) <> 0 And wkI(b + #WI_SWEEPMS) > 0 : iSweepEnd(n) = wkI(b + #WI_SWEEPMS) * 48 : EndIf
+    iVib(n) = wkI(b + #WI_VIB) : iVibD(n) = wkI(b + #WI_VIBDELAY) * 48
+    iAttInc(n) = 0 : If wkI(b + #WI_A) > 0 : iAttInc(n) = (65536 / (wkI(b + #WI_A) * 48)) + 1 : EndIf
+    iTgt(n) = (wkI(b + #WI_S) * 65536) / 100
+    iDDiv(n) = wkI(b + #WI_D) * 48 : iDF(n) = wkI(b + 49)
+    iRDiv(n) = wkI(b + #WI_R) * 48 : iRF(n) = wkI(b + 50) : iRC(n) = wkI(b + 51)
+    ; FM: MuVoiceSample's Select alg as slots - 0-3 the operators, 4 none
+    alg = wkI(b + #WI_ALG)
+    iFbSh(n) = 0 : If wkI(b + #WI_FB) : iFbSh(n) = 9 - wkI(b + #WI_FB) : EndIf
+    If alg <= 3 : iNib(n) = $4443 : ElseIf alg = 4 : iNib(n) = $4431 : ElseIf alg <= 6 : iNib(n) = $4321 : Else : iNib(n) = $3210 : EndIf
+    For o = 0 To 3
+      q = (n * 4) + o : ob = b + #WI_OP + (o * 8)
+      pSrcA(q) = 4 : pSrcB(q) = 4
+      pTl8(q) = wkI(ob + 2) * 8
+      pMulK(q) = wkI(ob) * 2 : If pMulK(q) = 0 : pMulK(q) = 1 : EndIf
+      pAK(q) = PeekL(wkAttackK + (wkI(ob + 3) * 4))
+      pASub(q) = 0 : If wkI(ob + 3) > 0 : pASub(q) = 32 : EndIf
+      pDI(q) = PeekL(wkDecayInc + (wkI(ob + 4) * 4))
+      pSI(q) = PeekL(wkDecayInc + (wkI(ob + 6) * 4))
+      pRI(q) = PeekL(wkDecayInc + (((wkI(ob + 7) * 2) + 1) * 4))
+      sl = wkI(ob + 5) * 32 : If sl >= 15 * 32 : sl = #WK_SILENT : EndIf
+      pSlA(q) = sl << 16
+      pAF(q) = wkI(b + 52 + (o * 2)) : pAC(q) = wkI(b + 53 + (o * 2))
+    Next
+    q = n * 4
+    If alg = 0 Or alg = 3 Or alg = 4 Or alg = 5 Or alg = 6 : pSrcA(q + 1) = 0 : EndIf
+    If alg = 0 Or alg = 2 : pSrcA(q + 2) = 1 : EndIf
+    If alg = 1 : pSrcA(q + 2) = 0 : pSrcB(q + 2) = 1 : EndIf
+    If alg = 5 : pSrcA(q + 2) = 0 : EndIf
+    If alg = 0 Or alg = 1 Or alg = 4 : pSrcA(q + 3) = 2 : EndIf
+    If alg = 2 : pSrcA(q + 3) = 0 : pSrcB(q + 3) = 2 : EndIf
+    If alg = 3 : pSrcA(q + 3) = 1 : pSrcB(q + 3) = 2 : EndIf
+    If alg = 5 : pSrcA(q + 3) = 0 : EndIf
+  Next
+EndProcedure
+
+; a note's constants, at its first block
+Procedure WsNoteStart(i.i)
+  Protected n.i = vIns(i), b.i = vIns(i) * 64, g.i
+  vPUntil(i) = 0
+  If iKind(n) = 3
+    g = 8192
+    If iNib(n) = $4443 : g = 32768 : ElseIf iNib(n) = $4431 : g = 16384 : ElseIf iNib(n) = $4321 : g = 10923 : EndIf
+    g = (g * wkI(b + #WI_VOL) * vVel(i)) / 12700 : If g > 32767 : g = 32767 : EndIf
+    vGk(i) = g
+  Else
+    vGk(i) = wkI(b + #WI_VOL) * vVel(i)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  envelopes
+; ----------------------------------------------------------------------
+; one sample of a wave voice's envelope, the engine's own (MuVoiceSample);
+; 0 when the voice has ended
+Procedure.i WsWaveStep1(i.i)
+  Protected n.i = vIns(i)
+  Select vStage(i)
+    Case 1
+      If iAttInc(n) = 0
+        vLevel(i) = 65536
+      Else
+        vLevel(i) = vLevel(i) + iAttInc(n)
+      EndIf
+      If vLevel(i) >= 65536 : vLevel(i) = 65536 : vStage(i) = 2 : EndIf
+    Case 2
+      If iDDiv(n) > 0
+        vLevel(i) = vLevel(i) + (((iTgt(n) - vLevel(i)) * 4) / iDDiv(n))
+      Else
+        vLevel(i) = iTgt(n)
+      EndIf
+      If iTgt(n) = 0 And vLevel(i) < 64 : vLevel(i) = 0 : ProcedureReturn 0 : EndIf
+    Case 3
+      If iRDiv(n) > 0
+        vLevel(i) = vLevel(i) - ((vLevel(i) * 4) / iRDiv(n)) - 1
+      Else
+        vLevel(i) = 0
+      EndIf
+      If vLevel(i) <= 64 : vLevel(i) = 0 : ProcedureReturn 0 : EndIf
+  EndSelect
+  ProcedureReturn 1
+EndProcedure
+
+; 32 samples of it, in closed form (export_song.pb's factors)
+Procedure.i WsWaveStep32(i.i)
+  Protected n.i = vIns(i), lev.i = vLevel(i)
+  Select vStage(i)
+    Case 1
+      If iAttInc(n) = 0 : lev = 65536 : Else : lev = lev + (iAttInc(n) * 32) : EndIf
+      If lev >= 65536 : lev = 65536 : vStage(i) = 2 : EndIf
+    Case 2
+      If iDDiv(n) > 0
+        lev = iTgt(n) + (((lev - iTgt(n)) * iDF(n)) >> 16)
+      Else
+        lev = iTgt(n)
+      EndIf
+      If iTgt(n) = 0 And lev < 64 : vLevel(i) = 0 : ProcedureReturn 0 : EndIf
+    Case 3
+      If iRDiv(n) > 0 : lev = ((lev * iRF(n)) >> 16) - iRC(n) : Else : lev = 0 : EndIf
+      If lev <= 64 : vLevel(i) = 0 : ProcedureReturn 0 : EndIf
+  EndSelect
+  vLevel(i) = lev
+  ProcedureReturn 1
+EndProcedure
+
+; n samples of an FM voice's four operator envelopes (MuVoiceSample), in
+; closed form for 32; 0 when all four rest
+Procedure.i WsFmStep(i.i, n.i)
+  Protected o.i, k.i, q.i, s.i, att.i, st.i, live.i
+  For o = 0 To 3
+    k = (i * 4) + o : q = (vIns(i) * 4) + o
+    att = oAtt(k) : st = oStage(k)
+    If n = 32
+      Select st
+        Case 1
+          att = ((att * pAF(q)) >> 16) - pAC(q)
+          If att <= 0 : att = 0 : st = 2 : EndIf
+        Case 2
+          att = att + (pDI(q) * 32)
+          If att >= pSlA(q) : att = pSlA(q) : st = 3 : EndIf
+        Case 3
+          att = att + (pSI(q) * 32)
+        Case 4
+          att = att + (pRI(q) * 32)
+      EndSelect
+    Else
+      For s = 1 To n
+        Select st
+          Case 1
+            att = att - ((att * pAK(q)) >> 16) - pASub(q)
+            If att <= 0 : att = 0 : st = 2 : EndIf
+          Case 2
+            att = att + pDI(q)
+            If att >= pSlA(q) : att = pSlA(q) : st = 3 : EndIf
+          Case 3
+            att = att + pSI(q)
+          Case 4
+            att = att + pRI(q)
+        EndSelect
+        If att >= (#WK_SILENT << 16)
+          att = #WK_SILENT << 16
+          If st = 4 : st = 0 : EndIf
+        EndIf
+      Next
+    EndIf
+    If att >= (#WK_SILENT << 16)
+      att = #WK_SILENT << 16
+      If st = 4 : st = 0 : EndIf
+    EndIf
+    oAtt(k) = att : oStage(k) = st
+    If st <> 0 : live = 1 : EndIf
+  Next
+  ProcedureReturn live
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  what the RSP is told
+; ----------------------------------------------------------------------
+; the wave gain in Q15: level / 65536 x volume x velocity / 12700
+Procedure.i WsGain(i.i)
+  Protected g.i = ((vLevel(i) * vGk(i)) * #WS_M25400) >> 45
+  If g > 32767 : g = 32767 : EndIf
+  ProcedureReturn g
+EndProcedure
+
+; an FM operator's amplitude in Q15 (FmAmp x 4); 0 when silent
+Procedure.i WsAmp(k.i, q.i)
+  Protected a.i = (oAtt(k) >> 16) + pTl8(q)
+  If a >= #WK_SILENT Or oStage(k) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn PeekW(wkFmAmp + (a * 2)) * 4
+EndProcedure
+
+; the voice's increment for the 32 samples from its local time: the
+; engine's pitch (WkPitchAt), reused while neither sweep nor vibrato moves it
+Procedure.i WsInc(i.i)
+  Protected n.i = vIns(i), t.i = vT(i), inc.i
+  If t < vPUntil(i) : ProcedureReturn vPInc(i) : EndIf
+  inc = WkPitchAt(n * 64, vBase(i), t)
+  vPInc(i) = inc : vPUntil(i) = 0
+  If t >= iSweepEnd(n)
+    If iVib(n) = 0
+      vPUntil(i) = #WS_FOREVER
+    ElseIf t <= iVibD(n)
+      vPUntil(i) = iVibD(n) + 1
+    EndIf
+  EndIf
+  ProcedureReturn inc
+EndProcedure
+
+; a phase moved on by n samples of inc; the noise register stepped at each wrap
+Procedure WsNoiseAdvance(i.i, inc.i, n.i)
+  Protected total.i, w.i, nz.i
+  total = vPhase(i) + (inc * n)
+  w = total >> 32
+  vPhase(i) = total & $FFFFFFFF
+  If w > 0
+    nz = vNoise(i)
+    While w > 0
+      nz = ((nz >> 1) | (((nz ! (nz >> 3)) & 1) << 16)) & $1FFFF
+      w = w - 1
+    Wend
+    vNoise(i) = nz : vNval(i) = (nz & 16383) - 8192
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  one 64-sample block's records at rec; returns where the next block's go
+; ----------------------------------------------------------------------
+Procedure.i WsBlock(rec.i)
+  Protected ts.i, rowAt.i = -1, k.i, i.i, r.i, count.i, n.i, f.i, cf.i, p.i, m.i, inc.i, o.i, g.i, kind.i, live.i, ob.i, q.i, kk.i, oi.i
+  ts = wkTempo * wkSpeed
+  ; the row, on the engine's sample
+  If wkRowAcc <= 0
+    rowAt = 0
+  Else
+    k = (wkRowAcc + ts - 1) / ts
+    If k < 64 : rowAt = k : EndIf
+  EndIf
+  If rowAt >= 0
+    wkRowAcc = wkRowAcc - (rowAt * ts)
+    WkNextRow()
+    wkRowAcc = wkRowAcc + (48000 * 60) - ((64 - rowAt) * ts)
+  Else
+    wkRowAcc = wkRowAcc - (64 * ts)
+  EndIf
+  wkSamples = wkSamples + 64
+  ; the voices
+  count = 0 : r = rec + 160
+  For i = 0 To #WK_VOICES - 1
+    If vOn(i) = 0 : Continue : EndIf
+    n = vIns(i) : kind = iKind(n)
+    f = 0
+    PokeW(r + 6, 0)
+    If vT(i) = 0
+      ; a note this block begins: on the 8-sample grid the RSP works in
+      If rowAt > 0 : f = rowAt & ~7 : EndIf
+      PokeW(r + 6, 1)
+      WsNoteStart(i)
+    EndIf
+    PokeW(r + 0, kind) : PokeW(r + 2, i) : PokeW(r + 4, f)
+    PokeW(r + 14, iGL(n)) : PokeW(r + 16, iGR(n)) : PokeW(r + 18, iSend(n))
+    live = 1
+    If kind = 3
+      PokeW(r + 40, iFbSh(n)) : PokeW(r + 42, iNib(n))
+      g = vGk(i) : PokeW(r + 8, g) : PokeW(r + 10, g) : PokeW(r + 12, g)
+      kk = i * 4 : q = n * 4
+      For o = 0 To 3
+        ob = r + 44 + (o * 24)
+        PokeL(ob, oPhase(kk + o))
+        PokeW(ob + 18, pSrcA(q + o)) : PokeW(ob + 20, pSrcB(q + o))
+      Next
+      ; the control points at 0, 32, 64 and the increments between
+      For cf = 0 To 2
+        If cf * 32 >= f
+          For o = 0 To 3 : PokeW(r + 56 + (o * 24) + (cf * 2), WsAmp(kk + o, q + o)) : Next
+        Else
+          For o = 0 To 3 : PokeW(r + 56 + (o * 24) + (cf * 2), 0) : Next
+        EndIf
+        If cf < 2
+          m = 32 : p = cf * 32
+          If f > p : m = 32 - (f - p) : If m < 0 : m = 0 : EndIf : EndIf
+          inc = WsInc(i)
+          For o = 0 To 3
+            oi = (inc * pMulK(q + o)) >> 1
+            PokeL(r + 48 + (o * 24) + (cf * 4), oi)
+            oPhase(kk + o) = (oPhase(kk + o) + (oi * m)) & $FFFFFFFF
+          Next
+          If m > 0
+            vT(i) = vT(i) + m
+            If WsFmStep(i, m) = 0 : live = 0 : EndIf
+          EndIf
+        EndIf
+      Next
+    Else
+      ; a wave or noise voice
+      If kind = 1
+        PokeL(r + 20, (wsTab512 + ((((wkI((n * 64) + #WI_WAVE) * 8) + PeekA(wkNoteMip + vNote(i))) * 512) * 2)) & $FFFFFF)
+      Else
+        PokeL(r + 20, vNoise(i)) : PokeW(r + 36, vNval(i))
+      EndIf
+      PokeL(r + 24, vPhase(i))
+      For cf = 0 To 2
+        g = 0 : If cf * 32 >= f And live : g = WsGain(i) : EndIf
+        PokeW(r + 8 + (cf * 2), g)
+        If cf < 2
+          m = 32 : p = cf * 32
+          If f > p : m = 32 - (f - p) : If m < 0 : m = 0 : EndIf : EndIf
+          inc = WsInc(i)
+          PokeL(r + 28 + (cf * 4), inc)
+          If kind = 2
+            WsNoiseAdvance(i, inc, m)
+          Else
+            vPhase(i) = (vPhase(i) + (inc * m)) & $FFFFFFFF
+          EndIf
+          If m > 0 And live
+            vT(i) = vT(i) + m
+            If m = 32
+              live = WsWaveStep32(i)
+            Else
+              For k = 1 To m
+                If live : live = WsWaveStep1(i) : EndIf
+              Next
+            EndIf
+          EndIf
+        EndIf
+      Next
+    EndIf
+    If live = 0 : vOn(i) = 0 : EndIf
+    count = count + 1 : r = r + 160
+  Next
+  PokeW(rec + 0, count)
+  ProcedureReturn r
+EndProcedure
+
+;  the RSP and the audio interface
+; ----------------------------------------------------------------------
+; THE RSP IS SHARED (n64.n64, N64RspUse): a music task renders a buffer's
+; blocks as they are built and gives the RSP up when another program - the
+; graphics - asks for it (N64RspWanted), after the block it is on. So each
+; task puts the synthesiser back on the RSP (its code and data from RDRAM),
+; its sine table and its state (the FM feedback, the reverb's positions and
+; filters: 176 bytes at DMEM 32) - and takes the state away again after.
+;
+; THE BUFFERS: each audio buffer's 24 blocks are built a few at a time
+; (WsPump, #WS_STEP a call, so no call costs the screen a frame) into a
+; record area of its own; building runs one buffer ahead of rendering, into
+; the other area. Each block is rendered as soon as it is built and
+; the RSP is free (WsService, which is also the program's idle hook: it
+; runs while the CPU waits for the RDP and the vertical blank), and a buffer
+; is queued to the audio interface once all 24 are rendered.
+Global wsRArea.i, wsRendered.i, wsTaskBase.i
+Global Dim wsBuiltIn.i(2)              ; blocks built, by area
+Global Dim wsRecAt.i(2)                ; where the area's next block's records go
+Global Dim wsBlkAt.i(2 * #WS_BLOCKS)   ; where each block's records begin (area x 24 + block)
+
+Procedure WsAreaReset(a.i)
+  wsBuiltIn(a) = 0
+  wsRecAt(a) = #WS_REC : If a : wsRecAt(a) = #WS_REC2 : EndIf
+EndProcedure
+
+; Loads the song (the .wkmu at pi) and the synthesiser (the .rspfile at rsp).
+Procedure.i WsStart(pi.i, rsp.i)
+  Protected i.i
+  If WkOpen(pi) = 0 : ProcedureReturn 0 : EndIf
+  WsPrep()
+  wsTab512 = #WK_RAM + PeekL(#WK_RAM + 88)
+  If N64RspCache(rsp, #WS_CODE) = 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To (#WS_STATE_LEN / 8) - 1 : PokeI(#WS_STATE + (i * 8), 0) : Next
+  For i = 0 To ($A000 / 8) - 1 : PokeI(#WS_COMBS + (i * 8), 0) : Next
+  For i = 0 To 79 : PokeW(#WS_RVK + (i * 2), PeekW(?WsRvk + (i * 2))) : Next
+  N64AudioInit(#WK_RATE)
+  wsBuf = 0 : wsBusy = 0 : wsOn = 1 : wsRArea = 0 : wsRendered = 0
+  WsAreaReset(0) : WsAreaReset(1)
+  ProcedureReturn 1
+EndProcedure
+
+; Up to n more blocks: the buffer being rendered first, then the next.
+Procedure WsBuild(n.i)
+  Protected i.i, a.i
+  While n > 0
+    a = wsRArea
+    If wsBuiltIn(a) = #WS_BLOCKS : a = 1 - a : EndIf
+    If wsBuiltIn(a) = #WS_BLOCKS : ProcedureReturn : EndIf
+    wsBlkAt((a * #WS_BLOCKS) + wsBuiltIn(a)) = wsRecAt(a)
+    wsRecAt(a) = WsBlock(wsRecAt(a))
+    wsBuiltIn(a) = wsBuiltIn(a) + 1 : n = n - 1
+    ; the running task sees it at once
+    If wsBusy And a = wsRArea : PokeL(#N64_DMEM + #WS_TASK + 0, wsBuiltIn(a) - wsTaskBase) : EndIf
+    If wsBuiltIn(a) = #WS_BLOCKS
+      ; what is sounding, for the screen
+      For i = 0 To 31 : wkInsActive(i) = 0 : Next
+      wkActive = 0 : wkActiveFm = 0 : wkActiveWave = 0
+      For i = 0 To #WK_VOICES - 1
+        If vOn(i)
+          wkActive = wkActive + 1
+          wkInsActive(vIns(i)) = wkInsActive(vIns(i)) + 1
+          If iKind(vIns(i)) = 3 : wkActiveFm = wkActiveFm + 1 : Else : wkActiveWave = wkActiveWave + 1 : EndIf
+        EndIf
+      Next
+      If wkActive > wkPeak : wkPeak = wkActive : EndIf
+    EndIf
+  Wend
+EndProcedure
+
+; The RSP on the rest of the buffer being rendered (it must be free): the
+; task renders each block as it is built, until all n are done or the RSP
+; is wanted by another program.
+Procedure WsLaunch(n.i)
+  Protected out.i = #N64_AUDIO + (wsBuf * #WS_FRAMES * 4) + (wsRendered * 256)
+  wsTaskBase = wsRendered
+  N64RspUse(#WS_CODE, #WS_OWNER)
+  N64SpDmaIn(#WS_SINQ, wkFmSin, 2056)
+  N64SpDmaIn(#WS_STATE_DMEM, #WS_STATE, #WS_STATE_LEN)
+  PokeL(#N64_DMEM + #WS_TASK + 0, wsBuiltIn(wsRArea) - wsRendered)
+  PokeL(#N64_DMEM + #WS_TASK + 20, 0)
+  PokeL(#N64_DMEM + #WS_TASK + 24, n)
+  PokeL(#N64_DMEM + #WS_TASK + 4, wsBlkAt((wsRArea * #WS_BLOCKS) + wsRendered) & $FFFFFF)
+  PokeL(#N64_DMEM + #WS_TASK + 8, out & $FFFFFF)
+  PokeL(#N64_DMEM + #WS_TASK + 12, #WS_COMBS & $FFFFFF)
+  PokeL(#N64_DMEM + #WS_TASK + 16, #WS_APS & $FFFFFF)
+  N64RspRun()
+  wsBusy = 1
+EndProcedure
+
+; A task the RSP has finished: its state kept, the blocks it rendered counted.
+Procedure WsSettle()
+  N64SpDmaOut(#WS_STATE_DMEM, #WS_STATE, #WS_STATE_LEN)
+  wsRendered = wsRendered + PeekL(#N64_DMEM + #WS_TASK + 28)
+  wsBusy = 0 : N64RspOwner = 0
+EndProcedure
+
+; The next buffer: the records, then the RSP on all of it in one task -
+; for tests and measurements, which wait for N64RspDone(), WsSettle() and
+; queue the buffer themselves.
+Procedure WsKick()
+  WsAreaReset(wsRArea) : wsRendered = 0
+  WsBuild(#WS_BLOCKS)
+  WsLaunch(#WS_BLOCKS)
+EndProcedure
+
+; The RSP's side: a finished task settled, a whole buffer queued, the next
+; task started. Short - it is the idle hook.
+Procedure WsService()
+  Protected n.i
+  If wsOn = 0 : ProcedureReturn : EndIf
+  If wsBusy
+    If N64RspDone()
+      WsSettle()
+    ElseIf N64RspWanted
+      PokeL(#N64_DMEM + #WS_TASK + 20, 1)       ; another program is waiting: give the RSP up after this block
+    EndIf
+  EndIf
+  If wsRendered = #WS_BLOCKS
+    If N64AudioFull() : ProcedureReturn : EndIf
+    N64AudioQueue(#N64_AUDIO + (wsBuf * #WS_FRAMES * 4), #WS_FRAMES * 4)
+    wsBuf = wsBuf + 1 : If wsBuf >= 3 : wsBuf = 0 : EndIf
+    WsAreaReset(wsRArea) : wsRArea = 1 - wsRArea : wsRendered = 0
+  EndIf
+  ; the RSP, when it is free and nothing else is waiting for it
+  If wsBusy = 0 And N64RspOwner = 0 And N64RspWanted = 0 And wsBuiltIn(wsRArea) > wsRendered
+    WsLaunch(#WS_BLOCKS - wsRendered)
+  EndIf
+EndProcedure
+
+; Keeps the audio interface fed: call it a few times a frame.
+Procedure WsPump()
+  If wsOn = 0 : ProcedureReturn : EndIf
+  WsService()
+  WsBuild(#WS_STEP)
+  WsService()
+EndProcedure
+
+; The sample being heard now (approximately: what is built, less the
+; buffers between it and the speaker).
+Procedure.i WsHeard()
+  Protected h.i = wkSamples - ((wsBuiltIn(0) + wsBuiltIn(1)) * 64) - ((3 * #WS_FRAMES) / 2)
+  If h < 0 : h = 0 : EndIf
+  ProcedureReturn h
+EndProcedure
+
+; THE REVERB'S CONSTANTS for wk_synth.rsp, which runs a comb's low-pass 8
+; samples at a time in closed form: lp(j) = sum over k <= j of a d^(j-k) y(k)
+; + d^(j+1) lp(-1), a = 26214 / 32768 and d = 6554 / 32768 (the engine's
+; damping). Rows 0-7: the weights of y(k) in Q15 (row k, lane j); row 8: the
+; weights of lp(-1); row 9: 8192 (>> 3), 16384 (>> 2), 27525 (the feedback),
+; 32768 (>> 1), 19660 (0.6, the wet level / 8 / 4), 8, 1, 0.
+DataSection
+WsRvk:
+  Data.w 26214, 5243, 1049, 210, 42, 8, 2, 0
+  Data.w 0, 26214, 5243, 1049, 210, 42, 8, 2
+  Data.w 0, 0, 26214, 5243, 1049, 210, 42, 8
+  Data.w 0, 0, 0, 26214, 5243, 1049, 210, 42
+  Data.w 0, 0, 0, 0, 26214, 5243, 1049, 210
+  Data.w 0, 0, 0, 0, 0, 26214, 5243, 1049
+  Data.w 0, 0, 0, 0, 0, 0, 26214, 5243
+  Data.w 0, 0, 0, 0, 0, 0, 0, 26214
+  Data.w 6554, 1311, 262, 52, 10, 2, 0, 0
+  Data.w 8192, 16384, 27525, -32768, 19660, 8, 1, 0
+EndDataSection

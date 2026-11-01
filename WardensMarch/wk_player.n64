@@ -1,0 +1,1300 @@
+; ======================================================================
+;  wk_player.n64 - the Warden's Key music engine, in PureMetal, live on
+;                  the Nintendo 64
+; ======================================================================
+;  A port of the game's src/wk_music.pbi, statement for statement: 32
+;  voices, each a wavetable voice (band-limited tables, noise, an envelope
+;  in milliseconds, a pitch sweep, a delayed vibrato) or a 4-operator FM
+;  voice (the sound chip's algorithms, feedback, envelopes); constant-power
+;  pan; a Schroeder/Moorer reverb (four combs and two all-passes a side);
+;  the tracker's sequencer with its exact fractional row timing. It runs at
+;  the game's 48000 samples a second on the VR4300.
+;
+;  It reads what export_song.pb writes (a .wkmu file on the cartridge): the
+;  engine's own tables, computed by the engine's own code on the PC, the
+;  instruments, and the song as rows of note events. WkStart(pi) loads it into
+;  RDRAM and starts it; WkPump() keeps the audio interface fed, synthesising
+;  each buffer as it is needed.
+;
+;  Where the port is not the PC engine bit for bit, it says so here:
+;   * the vibrato's sine. The engine evaluates Sin() in double precision
+;     every 32 samples; this reads a 16384-step table (Sin x 2^30, made by the
+;     PC) with linear interpolation, and keeps the phase in 32.32 fixed point.
+;     The value is rounded to whole cents either way, so the two agree except
+;     where a value lands within about a millionth of a half cent.
+;  Everything else is the engine's integer arithmetic on the engine's tables.
+; ======================================================================
+
+#WK_RAM = $80380000                     ; the file, in RDRAM (cached), 512 KB
+#WK_VOICES = 32
+#WK_CHANS = 16
+#WK_CHAN_VOICES = 16
+#WK_SILENT = 1023
+#WK_RATE = 48000
+#WK_FRAMES = 1600                       ; a buffer: 1/30 s
+#WK_BUFS = 3
+#WK_CHUNK = 256                         ; samples rendered at a time (the data cache is 8 KB)
+
+; the file's sections
+Global wkFmSin.i, wkFmAmp.i, wkAttackK.i, wkDecayInc.i, wkCentQ.i, wkNoteMip.i, wkTab.i, wkIns.i, wkRowIx.i, wkEv.i, wkVib.i
+Global wkTempo.i, wkSpeed.i, wkRows.i, wkLoopRow.i, wkNIns.i, wkIncC1.i, wkOn.i
+
+; instruments: 64 fields each (export_song.pb)
+Global Dim wkI.i(64 * 32)
+#WI_FM = 0 : #WI_WAVE = 1 : #WI_A = 2 : #WI_D = 3 : #WI_S = 4 : #WI_R = 5 : #WI_VOL = 6 : #WI_SEND = 7
+#WI_SWEEP = 8 : #WI_SWEEPMS = 9 : #WI_VIB = 10 : #WI_VIBDELAY = 11 : #WI_VIBINC = 12 : #WI_ALG = 13 : #WI_FB = 14
+#WI_GL = 15 : #WI_GR = 16 : #WI_OP = 17          ; + op * 8: mul dt tl ar dr sl sr rr
+
+; the voices
+Global Dim vOn.i(#WK_VOICES)
+Global Dim vIns.i(#WK_VOICES)
+Global Dim vNote.i(#WK_VOICES)
+Global Dim vVel.i(#WK_VOICES)
+Global Dim vChan.i(#WK_VOICES)
+Global Dim vBorn.i(#WK_VOICES)
+Global Dim vPhase.i(#WK_VOICES)
+Global Dim vInc.i(#WK_VOICES)
+Global Dim vBase.i(#WK_VOICES)
+Global Dim vLevel.i(#WK_VOICES)
+Global Dim vStage.i(#WK_VOICES)
+Global Dim vT.i(#WK_VOICES)
+Global Dim vNoise.i(#WK_VOICES)
+Global Dim vNval.i(#WK_VOICES)
+Global Dim vOprev.i(#WK_VOICES)
+Global Dim oPhase.i(#WK_VOICES * 4)
+Global Dim oInc.i(#WK_VOICES * 4)
+Global Dim oAtt.i(#WK_VOICES * 4)
+Global Dim oStage.i(#WK_VOICES * 4)
+Global Dim oOut.i(#WK_VOICES * 4)
+
+; the channels' voices
+Global Dim cVoice.i(#WK_CHANS * #WK_CHAN_VOICES)
+Global Dim cCount.i(#WK_CHANS)
+
+; the sequencer and the counters the screen shows
+Global wkRow.i, wkRowAcc.i, wkSamples.i, wkNotes.i, wkSteals.i, wkActive.i, wkPeak.i
+Global wkActiveFm.i, wkActiveWave.i
+Global Dim wkInsActive.i(32)                    ; voices sounding per instrument, the last sample of a buffer
+
+; ----------------------------------------------------------------------
+Procedure.i WkCartLong(pi.i)
+  ProcedureReturn N64CartLong(pi)
+EndProcedure
+
+; Loads the .wkmu at cartridge address pi. 0 when it is not one.
+Procedure.i WkOpen(pi.i)
+  Protected size.i, i.i, n.i
+  If N64CartLong(pi) <> $574B4D55 : ProcedureReturn 0 : EndIf      ; "WKMU"
+  size = N64CartLong(pi + 76)
+  If size <= 0 Or size > $80000 : ProcedureReturn 0 : EndIf
+  N64CartRead(pi, #WK_RAM, (size + 7) & ~7)
+  wkTempo = PeekL(#WK_RAM + 8) : wkSpeed = PeekL(#WK_RAM + 12)
+  wkRows = PeekL(#WK_RAM + 16) : wkLoopRow = PeekL(#WK_RAM + 20) : wkNIns = PeekL(#WK_RAM + 24)
+  wkFmSin = #WK_RAM + PeekL(#WK_RAM + 32)
+  wkFmAmp = #WK_RAM + PeekL(#WK_RAM + 36)
+  wkAttackK = #WK_RAM + PeekL(#WK_RAM + 40)
+  wkDecayInc = #WK_RAM + PeekL(#WK_RAM + 44)
+  wkCentQ = #WK_RAM + PeekL(#WK_RAM + 48)
+  wkNoteMip = #WK_RAM + PeekL(#WK_RAM + 52)
+  wkTab = #WK_RAM + PeekL(#WK_RAM + 56)
+  wkIns = #WK_RAM + PeekL(#WK_RAM + 60)
+  wkRowIx = #WK_RAM + PeekL(#WK_RAM + 64)
+  wkEv = #WK_RAM + PeekL(#WK_RAM + 68)
+  wkVib = #WK_RAM + PeekL(#WK_RAM + 72)
+  wkIncC1 = ((PeekL(#WK_RAM + 80) & $FFFFFFFF) << 32) | (PeekL(#WK_RAM + 84) & $FFFFFFFF)
+  For i = 0 To (wkNIns * 64) - 1
+    wkI(i) = PeekL(wkIns + (i * 4))
+  Next
+  For i = 0 To #WK_VOICES - 1 : vOn(i) = 0 : Next
+  For i = 0 To #WK_CHANS - 1 : cCount(i) = 0 : Next
+  wkRow = 0 : wkRowAcc = 0 : wkSamples = 0 : wkNotes = 0 : wkSteals = 0
+  ProcedureReturn 1
+EndProcedure
+
+; MuIncCents: the phase increment (2^32 a cycle) for cents above C-1
+Procedure.i WkIncCents(cents.i)
+  Protected oct.i, rem.i, inc.i
+  If cents < 0 : cents = 0 : EndIf
+  oct = cents / 1200 : rem = cents % 1200
+  inc = (wkIncC1 * (PeekL(wkCentQ + (rem * 4)) & $FFFFFFFF)) >> 16
+  inc = (inc << oct) >> 16
+  ProcedureReturn inc
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MuNoteOn / MuNoteOff
+; ----------------------------------------------------------------------
+Procedure.i WkNoteOn(ins.i, note.i, vel.i, chan.i)
+  Protected i.i, best.i = -1, o.i, b.i, mul.i, dt.i, inc.i
+  For i = 0 To #WK_VOICES - 1
+    If vOn(i) = 0 : best = i : Break : EndIf
+  Next
+  If best < 0
+    For i = 0 To #WK_VOICES - 1
+      If vOn(i) = 2
+        If best < 0
+          best = i
+        ElseIf vBorn(i) < vBorn(best)
+          best = i
+        EndIf
+      EndIf
+    Next
+    If best < 0
+      best = 0
+      For i = 1 To #WK_VOICES - 1 : If vBorn(i) < vBorn(best) : best = i : EndIf : Next
+    EndIf
+    wkSteals = wkSteals + 1
+  EndIf
+  b = ins * 64
+  vOn(best) = 1 : vIns(best) = ins : vNote(best) = note : vVel(best) = vel : vChan(best) = chan
+  vBorn(best) = wkSamples + wkNotes
+  vPhase(best) = 0 : vBase(best) = note * 100
+  vInc(best) = WkIncCents(vBase(best) + wkI(b + #WI_SWEEP))
+  vLevel(best) = 0 : vStage(best) = 1 : vT(best) = 0 : vNoise(best) = $5A5A + (best * 77) : vNval(best) = 0
+  For o = 0 To 3
+    oPhase(best * 4 + o) = 0 : oOut(best * 4 + o) = 0 : oInc(best * 4 + o) = 0
+    If wkI(b + #WI_FM)
+      mul = wkI(b + #WI_OP + (o * 8)) * 2 : If mul = 0 : mul = 1 : EndIf
+      inc = (vInc(best) * mul) >> 1
+      dt = wkI(b + #WI_OP + (o * 8) + 1)
+      If dt & 3
+        If dt & 4
+          inc = inc - ((inc * (dt & 3) * 3) >> 12)
+        Else
+          inc = inc + ((inc * (dt & 3) * 3) >> 12)
+        EndIf
+      EndIf
+      oInc(best * 4 + o) = inc
+      If wkI(b + #WI_OP + (o * 8) + 3) >= 31
+        oAtt(best * 4 + o) = 0 : oStage(best * 4 + o) = 2
+      Else
+        oAtt(best * 4 + o) = #WK_SILENT << 16 : oStage(best * 4 + o) = 1
+      EndIf
+    EndIf
+  Next
+  vOprev(best) = 0
+  wkNotes = wkNotes + 1
+  ProcedureReturn best
+EndProcedure
+
+Procedure WkNoteOff(i.i)
+  Protected o.i
+  If vOn(i) <> 1 : ProcedureReturn : EndIf
+  vOn(i) = 2 : vStage(i) = 3
+  For o = 0 To 3
+    If oStage(i * 4 + o) <> 0 : oStage(i * 4 + o) = 4 : EndIf
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MuReverb
+; ----------------------------------------------------------------------
+Global Dim rvComb.w(8 * 2048)          ; .w, as the engine's MuCombBuf: a quarter of the cache lines
+Global Dim rvCombLen.i(8)
+Global Dim rvCombPos.i(8)
+Global Dim rvCombLp.i(8)
+Global Dim rvAp.w(4 * 1024)
+Global Dim rvApLen.i(4)
+Global Dim rvApPos.i(4)
+#RV_FEEDBACK = 27525
+#RV_DAMP = 6554
+#RV_WET = 9830
+
+Procedure WkReverbReset()
+  Protected i.i
+  For i = 0 To 8 * 2048 - 1 : rvComb(i) = 0 : Next
+  For i = 0 To 4 * 1024 - 1 : rvAp(i) = 0 : Next
+  rvCombLen(0) = 1695 : rvCombLen(1) = 1760 : rvCombLen(2) = 1623 : rvCombLen(3) = 1548
+  For i = 0 To 3 : rvCombLen(i + 4) = rvCombLen(i) + 25 : Next
+  For i = 0 To 7 : rvCombPos(i) = 0 : rvCombLp(i) = 0 : Next
+  rvApLen(0) = 605 : rvApLen(1) = 245 : rvApLen(2) = 630 : rvApLen(3) = 270
+  For i = 0 To 3 : rvApPos(i) = 0 : Next
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  the sequencer: MuNextRow / MuPlayToken over the exported events
+; ----------------------------------------------------------------------
+Procedure WkNextRow()
+  Protected e.i, eEnd.i, p.i, ch.i, j.i
+  e = PeekL(wkRowIx + (wkRow * 4)) : eEnd = PeekL(wkRowIx + ((wkRow + 1) * 4))
+  While e < eEnd
+    p = wkEv + (e * 8)
+    ch = PeekA(p)
+    If PeekA(p + 1) = 0
+      ; a token: the channel's notes that are still its own are released
+      For j = 0 To cCount(ch) - 1
+        If vChan(cVoice((ch * #WK_CHAN_VOICES) + j)) = ch : WkNoteOff(cVoice((ch * #WK_CHAN_VOICES) + j)) : EndIf
+      Next
+      cCount(ch) = 0
+    ElseIf cCount(ch) < #WK_CHAN_VOICES
+      cVoice((ch * #WK_CHAN_VOICES) + cCount(ch)) = WkNoteOn(PeekA(p + 2), PeekA(p + 3), PeekA(p + 4), ch)
+      cCount(ch) = cCount(ch) + 1
+    EndIf
+    e = e + 1
+  Wend
+  wkRow = wkRow + 1
+  If wkRow >= wkRows : wkRow = wkLoopRow : EndIf
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  THE VOICES, A BLOCK AT A TIME
+; ----------------------------------------------------------------------
+; The engine computes one sample of every voice, then the next. A voice's
+; samples depend only on that voice, and notes start and stop only at row
+; boundaries, so the same arithmetic may be done one VOICE at a time over a
+; block of samples between two rows - and an FM voice one OPERATOR at a
+; time, since an operator reads only lower-numbered operators of the same
+; sample. Each loop then keeps its few values in registers (the compiler's
+; locals in s0..s7) instead of walking every voice's arrays every sample.
+; Nothing is approximated: every statement below is the engine's, on the
+; engine's integers, in a different order of loops.
+;
+; THE DIVIDES. The engine divides in its per-sample path; a VR4300 divide is
+; 69 cycles. Each is either hoisted (its operands do not change in the
+; block) or done as an exact multiply and shift: q = (x * M) >> k with
+; M = ceil(2^k / d) and k = N + ceil(log2 d) is exact for 0 <= x < 2^N
+; (Granlund and Montgomery), and the sign is put back for a negative x, which
+; is the engine's truncation toward zero. The constants were checked
+; exhaustively for the fixed divisors and for every envelope length.
+Global Dim mixL.l(#WK_FRAMES)          ; .l: a voice's sum fits, and half the cache lines
+Global Dim mixR.l(#WK_FRAMES)
+Global Dim mixS.l(#WK_FRAMES)
+Global Dim opO.l(4 * #WK_FRAMES)          ; operator k's output for sample j at k * #WK_FRAMES + j
+Global Dim segInc.i(#WK_FRAMES / 32 + 4)
+Global wkSegEnd.i                          ; the increment in force at the block's end
+
+#WK_M12700 = 692605750 : #WK_K12700 = 43
+#WK_M100 = 5368710 : #WK_K100 = 29
+#WK_M3 = 87382 : #WK_K3 = 18
+
+; the magic pair for dividing numbers below 2^19 by d (d >= 1)
+Global wkMagM.i, wkMagK.i
+Procedure WkMagic(d.i)
+  Protected k.i = 19, v.i = 1
+  While v < d : v = v << 1 : k = k + 1 : Wend
+  wkMagM = ((1 << k) + d - 1) / d
+  wkMagK = k
+EndProcedure
+
+; The voice's pitch at sample t of its note (the every-32-samples update):
+; the sweep falling, the vibrato coming in. Returns the voice increment.
+Procedure.i WkPitchAt(b.i, base.i, t.i)
+  Protected c.i = base, sweep.i, sweepMs.i, vib.i, vd.i, ph.i, idx.i, frac.i, s0.i, s1.i, x.i
+  sweep = wkI(b + #WI_SWEEP) : sweepMs = wkI(b + #WI_SWEEPMS)
+  If sweep <> 0 And sweepMs > 0
+    If t < sweepMs * 48 : c = c + sweep - ((sweep * t) / (sweepMs * 48)) : EndIf
+  EndIf
+  vib = wkI(b + #WI_VIB)
+  If vib <> 0
+    vd = wkI(b + #WI_VIBDELAY) * 48
+    If t > vd
+      ph = ((t - vd) * wkI(b + #WI_VIBINC)) & $FFFFFFFF
+      idx = ph >> 18 : frac = ph & $3FFFF
+      s0 = PeekL(wkVib + (idx * 4)) : s1 = PeekL(wkVib + (((idx + 1) & 16383) * 4))
+      x = (s0 + (((s1 - s0) * frac) >> 18)) * vib
+      If x >= 0
+        c = c + ((x + $20000000) >> 30)
+      Else
+        c = c - ((-x + $20000000) >> 30)
+      EndIf
+    EndIf
+  EndIf
+  ProcedureReturn WkIncCents(c)
+EndProcedure
+
+; The segment increments of a block: segInc(s) is the voice increment from
+; the s-th sample of the block whose t is a multiple of 32 (segInc(0) is the
+; one in force at the block's start, which a block starting mid-segment
+; inherits from vInc).
+Procedure WkSegments(i.i, n.i)
+  Protected b.i = vIns(i) * 64, t.i = vT(i), j.i, s.i
+  segInc(0) = vInc(i) : s = 0
+  For j = 0 To n - 1
+    If (t & 31) = 0
+      If j = 0 : s = 0 : Else : s = s + 1 : EndIf
+      segInc(s) = WkPitchAt(b, vBase(i), t)
+    EndIf
+    t = t + 1
+  Next
+  wkSegEnd = segInc(s)
+EndProcedure
+
+; ---- the hot loops, in the VR4300's own instructions -----------------
+; The procedures below are PureMetal ASM blocks, assembled by PureMetal
+; Forge with the rest of the program. Each does exactly the PureMetal loop
+; quoted at its call site, on the same integers. They take their values
+; through wkP (a plain Global array, read and written with la/ld/sd) and use
+; only caller-saved registers plus s0..s7, which they save and restore
+; themselves; ra is free to use, because the procedure's own epilogue
+; reloads it from the frame.
+;
+; ADDRESSES ARE MADE 32-BIT FIRST (sll r, r, 0): a table pointer kept in a
+; Global is the positive number $80380000+, which the VR4300 refuses as an
+; address until it is sign-extended - the same rule EmitCore_Mips.pbi
+; applies to every pointer a program computes.
+Global Dim wkP.i(32)
+
+; WkFmOperator's sample loop. wkP in: 0 n, 1 att, 2 st, 3 tl8, 4 aK, 5 aSub,
+; 6 dI, 7 sI, 8 rI, 9 slA, 10 ph, 11 t, 12 mul, 13 the feedback shift (or
+; -1), 14 prev1, 15 prev2, 16 srcA, 17 srcB, 18 me (element offsets into
+; opO, -1 for none), 19 the sine table, 20 the amplitude table, 21 1 for
+; operator 1, 22 inc. Out: 1 att, 2 st, 10 ph, 14 prev1, 15 prev2, 22 inc,
+; 24 the first sample whose envelope rests at stage 0 (or n).
+Procedure WkOpLoop()
+  ASM
+    daddiu sp, sp, -80
+    sd gp, 64(sp)                ; gp is the variables' base (the compiler's): kept
+    sd s0, 0(sp)
+    sd s1, 8(sp)
+    sd s2, 16(sp)
+    sd s3, 24(sp)
+    sd s4, 32(sp)
+    sd s5, 40(sp)
+    sd s6, 48(sp)
+    sd s7, 56(sp)
+    la k0, global_wkp
+    ld a1, 0(k0)
+    ld a6, 8(k0)
+    ld a7, 16(k0)
+    ld t0, 24(k0)
+    ld t1, 32(k0)
+    ld t2, 40(k0)
+    ld t3, 48(k0)
+    ld t8, 56(k0)
+    ld t9, 64(k0)
+    ld gp, 72(k0)
+    ld a5, 80(k0)
+    ld a2, 88(k0)
+    ld s0, 96(k0)
+    ld s1, 104(k0)
+    ld s2, 112(k0)
+    ld s3, 120(k0)
+    la v1, global_opo
+    ld v0, 128(k0)
+    daddu s4, zero, zero
+    bltz v0, wkop_nosrca
+    nop
+    dsll v0, v0, 2
+    daddu s4, v1, v0
+wkop_nosrca:
+    ld v0, 136(k0)
+    daddu s5, zero, zero
+    bltz v0, wkop_nosrcb
+    nop
+    dsll v0, v0, 2
+    daddu s5, v1, v0
+wkop_nosrcb:
+    ld v0, 144(k0)
+    dsll v0, v0, 2
+    daddu s6, v1, v0
+    ld s7, 152(k0)
+    sll s7, s7, 0
+    ld ra, 160(k0)
+    sll ra, ra, 0
+    ld a4, 176(k0)
+    ld k0, 168(k0)
+    daddu a0, zero, zero
+    daddu a3, zero, zero
+    daddiu k1, zero, -1
+wkop_loop:
+    beq a0, a1, wkop_done
+    nop
+    andi v0, a2, 31
+    bne v0, zero, wkop_noseg
+    nop
+    beq a0, zero, wkop_seg0
+    nop
+    daddiu a3, a3, 1
+wkop_seg0:
+    la v0, global_seginc
+    dsll v1, a3, 3
+    daddu v0, v0, v1
+    ld v0, 0(v0)
+    dmultu v0, s0
+    mflo a4
+    dsrl a4, a4, 1
+wkop_noseg:
+    daddiu a2, a2, 1
+    daddiu v0, zero, 1
+    bne a7, v0, wkop_e2
+    nop
+    dmultu a6, t1
+    mflo v0
+    dsra v0, v0, 16
+    dsubu a6, a6, v0
+    dsubu a6, a6, t2
+    bgtz a6, wkop_clamp
+    nop
+    daddu a6, zero, zero
+    daddiu a7, zero, 2
+    j wkop_clamp
+    nop
+wkop_e2:
+    daddiu v0, zero, 2
+    bne a7, v0, wkop_e3
+    nop
+    daddu a6, a6, t3
+    slt v0, a6, gp
+    bne v0, zero, wkop_clamp
+    nop
+    daddu a6, gp, zero
+    daddiu a7, zero, 3
+    j wkop_clamp
+    nop
+wkop_e3:
+    daddiu v0, zero, 3
+    bne a7, v0, wkop_e4
+    nop
+    daddu a6, a6, t8
+    j wkop_clamp
+    nop
+wkop_e4:
+    daddiu v0, zero, 4
+    bne a7, v0, wkop_clamp
+    nop
+    daddu a6, a6, t9
+wkop_clamp:
+    lui v0, 1023
+    slt v1, a6, v0
+    bne v1, zero, wkop_rest
+    nop
+    daddu a6, v0, zero
+    daddiu v1, zero, 4
+    bne a7, v1, wkop_rest
+    nop
+    daddu a7, zero, zero
+wkop_rest:
+    bne a7, zero, wkop_mod
+    nop
+    bgez k1, wkop_mod
+    nop
+    daddu k1, a0, zero
+wkop_mod:
+    daddu at, zero, zero
+    bltz s1, wkop_nofb
+    nop
+    daddu v0, s2, s3
+    dsrav at, v0, s1
+wkop_nofb:
+    beq s4, zero, wkop_modend
+    nop
+    dsll v1, a0, 2
+    daddu v0, s4, v1
+    lw v0, 0(v0)
+    beq s5, zero, wkop_mod1
+    nop
+    daddu v1, s5, v1
+    lw v1, 0(v1)
+    daddu v0, v0, v1
+wkop_mod1:
+    dsra at, v0, 1
+wkop_modend:
+    dsra v0, a6, 16
+    daddu v0, v0, t0
+    slti v1, v0, 1023
+    beq v1, zero, wkop_zero
+    nop
+    beq a7, zero, wkop_zero
+    nop
+    dsrl v1, a5, 20
+    daddu v1, v1, at
+    andi v1, v1, 4095
+    dsll v1, v1, 1
+    daddu v1, v1, s7
+    lh v1, 0(v1)
+    dsll v0, v0, 1
+    daddu v0, v0, ra
+    lh v0, 0(v0)
+    mult v1, v0
+    mflo v0
+    dsra v0, v0, 13
+    j wkop_store
+    nop
+wkop_zero:
+    daddu v0, zero, zero
+wkop_store:
+    sw v0, 0(s6)
+    beq k0, zero, wkop_noprev
+    nop
+    daddu s3, s2, zero
+    daddu s2, v0, zero
+wkop_noprev:
+    daddu a5, a5, a4
+    dsll32 a5, a5, 0
+    dsrl32 a5, a5, 0
+    daddiu s6, s6, 4
+    daddiu a0, a0, 1
+    j wkop_loop
+    nop
+wkop_done:
+    bgez k1, wkop_zset
+    nop
+    daddu k1, a1, zero
+wkop_zset:
+    la k0, global_wkp
+    sd a6, 8(k0)
+    sd a7, 16(k0)
+    sd a5, 80(k0)
+    sd s2, 112(k0)
+    sd s3, 120(k0)
+    sd a4, 176(k0)
+    sd k1, 192(k0)
+    ld s0, 0(sp)
+    ld s1, 8(sp)
+    ld s2, 16(sp)
+    ld s3, 24(sp)
+    ld s4, 32(sp)
+    ld s5, 40(sp)
+    ld s6, 48(sp)
+    ld s7, 56(sp)
+    ld gp, 64(sp)
+    daddiu sp, sp, 80
+  EndASM
+EndProcedure
+
+; WkWaveBlock's sample loop. wkP in: 0 n, 1 t, 2 inc, 3 ph, 4 lev, 5 st,
+; 6 attInc, 7 tgt, 8 dM (0: no decay time), 9 rM (0: no release time),
+; 10 the wavetable, 11 1 for noise, 12 noise, 13 nval, 14 vol x vel, 15 gl,
+; 16 gr, 17 send, 18 p0, 19 1 for an instant attack. Out: 1 t, 2 inc, 3 ph,
+; 4 lev, 5 st, 12 noise, 13 nval, 20 1 when the voice ended in the block.
+Procedure WkWaveLoop()
+  ASM
+    daddiu sp, sp, -80
+    sd gp, 64(sp)                ; gp is the variables' base (the compiler's): kept
+    sd s0, 0(sp)
+    sd s1, 8(sp)
+    sd s2, 16(sp)
+    sd s3, 24(sp)
+    sd s4, 32(sp)
+    sd s5, 40(sp)
+    sd s6, 48(sp)
+    sd s7, 56(sp)
+    la v1, global_wkp
+    ld a1, 0(v1)
+    ld a2, 8(v1)
+    ld a4, 16(v1)
+    ld a5, 24(v1)
+    ld a6, 32(v1)
+    ld a7, 40(v1)
+    ld t0, 48(v1)
+    ld t1, 56(v1)
+    ld t2, 64(v1)
+    ld t3, 72(v1)
+    ld t8, 80(v1)
+    sll t8, t8, 0
+    ld t9, 88(v1)
+    ld gp, 96(v1)
+    ld k0, 104(v1)
+    ld k1, 112(v1)
+    ld s0, 120(v1)
+    ld s1, 128(v1)
+    ld s2, 136(v1)
+    ld v0, 144(v1)
+    dsll v0, v0, 2
+    la s3, global_mixl
+    daddu s3, s3, v0
+    la s4, global_mixr
+    daddu s4, s4, v0
+    la s5, global_mixs
+    daddu s5, s5, v0
+    ld s6, 152(v1)
+    daddu s7, zero, zero
+    daddu a0, zero, zero
+    daddu a3, zero, zero
+wkw_loop:
+    beq a0, a1, wkw_done
+    nop
+    andi v0, a2, 31
+    bne v0, zero, wkw_noseg
+    nop
+    beq a0, zero, wkw_seg0
+    nop
+    daddiu a3, a3, 1
+wkw_seg0:
+    la v0, global_seginc
+    dsll v1, a3, 3
+    daddu v0, v0, v1
+    ld a4, 0(v0)
+wkw_noseg:
+    daddiu a2, a2, 1
+    daddiu v0, zero, 1
+    bne a7, v0, wkw_e2
+    nop
+    beq s6, zero, wkw_e1add
+    nop
+    lui a6, 1
+    j wkw_e1cmp
+    nop
+wkw_e1add:
+    daddu a6, a6, t0
+wkw_e1cmp:
+    lui v0, 1
+    slt v1, a6, v0
+    bne v1, zero, wkw_osc
+    nop
+    daddu a6, v0, zero
+    daddiu a7, zero, 2
+    j wkw_osc
+    nop
+wkw_e2:
+    daddiu v0, zero, 2
+    bne a7, v0, wkw_e3
+    nop
+    bne t2, zero, wkw_e2div
+    nop
+    daddu a6, t1, zero
+    j wkw_e2end
+    nop
+wkw_e2div:
+    dsubu v0, t1, a6
+    dsll v0, v0, 2
+    bltz v0, wkw_e2neg
+    nop
+    dmultu v0, t2
+    mflo v0
+    dsrl32 v0, v0, 12
+    j wkw_e2add
+    nop
+wkw_e2neg:
+    dsubu v0, zero, v0
+    dmultu v0, t2
+    mflo v0
+    dsrl32 v0, v0, 12
+    dsubu v0, zero, v0
+wkw_e2add:
+    daddu a6, a6, v0
+wkw_e2end:
+    bne t1, zero, wkw_osc
+    nop
+    slti v0, a6, 64
+    beq v0, zero, wkw_osc
+    nop
+    daddu a6, zero, zero
+    daddiu s7, zero, 1
+    j wkw_done
+    nop
+wkw_e3:
+    daddiu v0, zero, 3
+    bne a7, v0, wkw_osc
+    nop
+    bne t3, zero, wkw_e3div
+    nop
+    daddu a6, zero, zero
+    j wkw_e3end
+    nop
+wkw_e3div:
+    dsll v0, a6, 2
+    dmultu v0, t3
+    mflo v0
+    dsrl32 v0, v0, 12
+    dsubu a6, a6, v0
+    daddiu a6, a6, -1
+wkw_e3end:
+    slti v0, a6, 65
+    beq v0, zero, wkw_osc
+    nop
+    daddu a6, zero, zero
+    daddiu s7, zero, 1
+    j wkw_done
+    nop
+wkw_osc:
+    beq t9, zero, wkw_table
+    nop
+    daddu a5, a5, a4
+    dsrl32 v0, a5, 0
+    beq v0, zero, wkw_hold
+    nop
+    dsll32 a5, a5, 0
+    dsrl32 a5, a5, 0
+    dsrl v0, gp, 3
+    xor v0, gp, v0
+    andi v0, v0, 1
+    dsll v0, v0, 16
+    dsrl v1, gp, 1
+    or gp, v1, v0
+    lui v0, 1
+    ori v0, v0, 65535
+    and gp, gp, v0
+    andi k0, gp, 16383
+    daddiu k0, k0, -8192
+wkw_hold:
+    daddu v0, k0, zero
+    j wkw_level
+    nop
+wkw_table:
+    dsrl v0, a5, 21
+    andi v0, v0, 2047
+    dsll v1, v0, 1
+    daddu v1, v1, t8
+    lh at, 0(v1)
+    daddiu v0, v0, 1
+    andi v0, v0, 2047
+    dsll v0, v0, 1
+    daddu v0, v0, t8
+    lh v0, 0(v0)
+    dsubu v0, v0, at
+    dsrl v1, a5, 5
+    andi v1, v1, 65535
+    dmult v0, v1
+    mflo v0
+    dsra v0, v0, 16
+    daddu v0, at, v0
+    daddu a5, a5, a4
+    dsll32 a5, a5, 0
+    dsrl32 a5, a5, 0
+wkw_level:
+    dsra v1, a6, 4
+    dmult v0, v1
+    mflo v0
+    dsra v0, v0, 12
+    nop
+    dmult v0, k1
+    mflo v0
+    li v1, 692605750
+    bltz v0, wkw_vneg
+    nop
+    dmultu v0, v1
+    mflo v0
+    dsrl32 v0, v0, 11
+    j wkw_mix
+    nop
+wkw_vneg:
+    dsubu v0, zero, v0
+    dmultu v0, v1
+    mflo v0
+    dsrl32 v0, v0, 11
+    dsubu v0, zero, v0
+wkw_mix:
+    nop
+    dmult v0, s0
+    mflo v1
+    dsra v1, v1, 15
+    lw at, 0(s3)
+    daddu at, at, v1
+    sw at, 0(s3)
+    dmult v0, s1
+    mflo v1
+    dsra v1, v1, 15
+    lw at, 0(s4)
+    daddu at, at, v1
+    sw at, 0(s4)
+    dmult v0, s2
+    mflo v0
+    li v1, 5368710
+    bltz v0, wkw_sneg
+    nop
+    dmultu v0, v1
+    mflo v0
+    dsrl v0, v0, 29
+    j wkw_send
+    nop
+wkw_sneg:
+    dsubu v0, zero, v0
+    dmultu v0, v1
+    mflo v0
+    dsrl v0, v0, 29
+    dsubu v0, zero, v0
+wkw_send:
+    lw at, 0(s5)
+    daddu at, at, v0
+    sw at, 0(s5)
+    daddiu s3, s3, 4
+    daddiu s4, s4, 4
+    daddiu s5, s5, 4
+    daddiu a0, a0, 1
+    j wkw_loop
+    nop
+wkw_done:
+    la v1, global_wkp
+    sd a2, 8(v1)
+    sd a4, 16(v1)
+    sd a5, 24(v1)
+    sd a6, 32(v1)
+    sd a7, 40(v1)
+    sd gp, 96(v1)
+    sd k0, 104(v1)
+    sd s7, 160(v1)
+    ld s0, 0(sp)
+    ld s1, 8(sp)
+    ld s2, 16(sp)
+    ld s3, 24(sp)
+    ld s4, 32(sp)
+    ld s5, 40(sp)
+    ld s6, 48(sp)
+    ld s7, 56(sp)
+    ld gp, 64(sp)
+    daddiu sp, sp, 80
+  EndASM
+EndProcedure
+
+; ---- one FM operator over the block ----------------------------------
+; o: which (0..3), wired by the algorithm to the lower operators' outputs
+; in opO; its own go to opO too. Returns the sample index at which its
+; envelope first rests at stage 0, or n.
+Procedure.i WkFmOperator(i.i, o.i, n.i, alg.i)
+  Protected b.i = vIns(i) * 64, ob.i, k.i, j.i, t.i, s.i, inc.i, ph.i, att.i, st.i, tl8.i, mul.i, a.i, md.i, zeroAt.i = -1
+  Protected aK.i, aSub.i, dI.i, sI.i, rI.i, slA.i, fb.i, prev1.i, prev2.i, sinT.i, ampT.i, F1.i, F2.i, me.i, srcA.i, srcB.i
+  k = (i * 4) + o : ob = b + #WI_OP + (o * 8)
+  ph = oPhase(k) : att = oAtt(k) : st = oStage(k) : tl8 = wkI(ob + 2) * 8
+  mul = wkI(ob) * 2 : If mul = 0 : mul = 1 : EndIf
+  aK = PeekL(wkAttackK + (wkI(ob + 3) * 4)) : aSub = 0 : If wkI(ob + 3) > 0 : aSub = 32 : EndIf
+  dI = PeekL(wkDecayInc + (wkI(ob + 4) * 4))
+  sI = PeekL(wkDecayInc + (wkI(ob + 6) * 4))
+  rI = PeekL(wkDecayInc + (((wkI(ob + 7) * 2) + 1) * 4))
+  slA = wkI(ob + 5) * 32 : If slA >= 15 * 32 : slA = #WK_SILENT : EndIf
+  slA = slA << 16
+  fb = wkI(b + #WI_FB)
+  prev1 = oOut(k) : prev2 = vOprev(i)
+  sinT = wkFmSin : ampT = wkFmAmp
+  F1 = #WK_FRAMES : F2 = 2 * #WK_FRAMES : me = o * #WK_FRAMES
+  ; THE ALGORITHM'S WIRING (MuVoiceSample's Select alg): which lower
+  ; operators feed this one - one (its output >> 1) or two (their sum >> 1)
+  srcA = -1 : srcB = -1
+  If o = 1
+    If alg = 0 Or alg = 3 Or alg = 4 Or alg = 5 Or alg = 6 : srcA = 0 : EndIf
+  ElseIf o = 2
+    If alg = 0 Or alg = 2 : srcA = F1 : EndIf
+    If alg = 1 : srcA = 0 : srcB = F1 : EndIf
+    If alg = 5 : srcA = 0 : EndIf
+  ElseIf o = 3
+    If alg = 0 Or alg = 1 Or alg = 4 : srcA = F2 : EndIf
+    If alg = 2 : srcA = 0 : srcB = F2 : EndIf
+    If alg = 3 : srcA = F1 : srcB = F2 : EndIf
+    If alg = 5 : srcA = 0 : EndIf
+  EndIf
+  t = vT(i) : inc = (segInc(0) * mul) >> 1
+  ; the per-sample loop is WkOpLoop's assembly (below); it is this loop:
+  ;   For j = 0 To n - 1
+  ;     If (t & 31) = 0 : If j > 0 : s = s + 1 : EndIf : inc = (segInc(s) * mul) >> 1 : EndIf
+  ;     t = t + 1
+  ;     Select st                      ; the envelope
+  ;       Case 1 : att = att - ((att * aK) >> 16) - aSub : If att <= 0 : att = 0 : st = 2 : EndIf
+  ;       Case 2 : att = att + dI : If att >= slA : att = slA : st = 3 : EndIf
+  ;       Case 3 : att = att + sI
+  ;       Case 4 : att = att + rI
+  ;     EndSelect
+  ;     If att >= (#WK_SILENT << 16) : att = #WK_SILENT << 16 : If st = 4 : st = 0 : EndIf : EndIf
+  ;     If st = 0 And zeroAt < 0 : zeroAt = j : EndIf
+  ;     md = 0                         ; the modulation, wired above by the algorithm
+  ;     If o = 0 : If fb : md = (prev1 + prev2) >> (9 - fb) : EndIf
+  ;     ElseIf srcB >= 0 : md = (opO(srcA + j) + opO(srcB + j)) >> 1
+  ;     ElseIf srcA >= 0 : md = opO(srcA + j) >> 1 : EndIf
+  ;     a = (att >> 16) + tl8
+  ;     If a >= #WK_SILENT Or st = 0 : a = 0
+  ;     Else : a = (PeekW(sinT + ((((ph >> 20) + md) & 4095) * 2)) * PeekW(ampT + (a * 2))) >> 13 : EndIf
+  ;     opO(me + j) = a
+  ;     If o = 0 : prev2 = prev1 : prev1 = a : EndIf
+  ;     ph = (ph + inc) & $FFFFFFFF
+  ;   Next
+  wkP(0) = n : wkP(1) = att : wkP(2) = st : wkP(3) = tl8 : wkP(4) = aK : wkP(5) = aSub
+  wkP(6) = dI : wkP(7) = sI : wkP(8) = rI : wkP(9) = slA : wkP(10) = ph : wkP(11) = t
+  wkP(12) = mul : wkP(13) = -1 : If o = 0 And fb : wkP(13) = 9 - fb : EndIf
+  wkP(14) = prev1 : wkP(15) = prev2 : wkP(16) = srcA : wkP(17) = srcB : wkP(18) = me
+  wkP(19) = sinT : wkP(20) = ampT : wkP(21) = 0 : If o = 0 : wkP(21) = 1 : EndIf : wkP(22) = inc
+  WkOpLoop()
+  att = wkP(1) : st = wkP(2) : ph = wkP(10) : inc = wkP(22) : prev1 = wkP(14) : prev2 = wkP(15) : zeroAt = wkP(24)
+  oPhase(k) = ph : oAtt(k) = att : oStage(k) = st : oInc(k) = inc
+  If o = 0 : oOut(k) = prev1 : vOprev(i) = prev2 : EndIf
+  If zeroAt < 0 : zeroAt = n : EndIf
+  ProcedureReturn zeroAt
+EndProcedure
+
+; A whole FM voice over n samples into the mix (from p0). The voice stops
+; at the first sample where all four operators rest - as the engine's
+; voice does, contributing nothing from that sample on.
+Procedure WkFmBlock(i.i, p0.i, n.i)
+  Protected b.i = vIns(i) * 64, alg.i, e.i, z.i, j.i, out.i, x.i, gl.i, gr.i, sd.i, vv.i, F1.i = #WK_FRAMES, F2.i = 2 * #WK_FRAMES, F3.i = 3 * #WK_FRAMES, mix.i
+  alg = wkI(b + #WI_ALG)
+  WkSegments(i, n)
+  e = WkFmOperator(i, 0, n, alg)
+  z = WkFmOperator(i, 1, n, alg) : If z > e : e = z : EndIf
+  z = WkFmOperator(i, 2, n, alg) : If z > e : e = z : EndIf
+  z = WkFmOperator(i, 3, n, alg) : If z > e : e = z : EndIf
+  gl = wkI(b + #WI_GL) : gr = wkI(b + #WI_GR) : sd = wkI(b + #WI_SEND)
+  vv = wkI(b + #WI_VOL) * vVel(i)
+  ; what the voice puts out, by the algorithm: op 4 alone (0-3), ops 2 and 4
+  ; (4), ops 2-4 over three (5, 6), all four (7)
+  mix = 3
+  If alg <= 3 : mix = 0 : ElseIf alg = 4 : mix = 1 : ElseIf alg <= 6 : mix = 2 : EndIf
+  For j = 0 To e - 1
+    If mix = 0
+      out = opO(F3 + j)
+    ElseIf mix = 1
+      out = (opO(F1 + j) + opO(F3 + j)) >> 1
+    ElseIf mix = 2
+      out = opO(F1 + j) + opO(F2 + j) + opO(F3 + j)
+      If out >= 0 : out = (out * #WK_M3) >> #WK_K3 : Else : out = -((-out * #WK_M3) >> #WK_K3) : EndIf
+    Else
+      out = (opO(j) + opO(F1 + j) + opO(F2 + j) + opO(F3 + j)) >> 2
+    EndIf
+    x = out * vv
+    If x >= 0 : out = (x * #WK_M12700) >> #WK_K12700 : Else : out = -((-x * #WK_M12700) >> #WK_K12700) : EndIf
+    mixL(p0 + j) = mixL(p0 + j) + ((out * gl) >> 15)
+    mixR(p0 + j) = mixR(p0 + j) + ((out * gr) >> 15)
+    x = out * sd
+    If x >= 0 : x = (x * #WK_M100) >> #WK_K100 : Else : x = -((-x * #WK_M100) >> #WK_K100) : EndIf
+    mixS(p0 + j) = mixS(p0 + j) + x
+  Next
+  If e < n
+    vOn(i) = 0
+  Else
+    vT(i) = vT(i) + n
+    vInc(i) = wkSegEnd
+  EndIf
+EndProcedure
+
+; A wavetable or noise voice over n samples into the mix (from p0).
+Procedure WkWaveBlock(i.i, p0.i, n.i)
+  Protected b.i = vIns(i) * 64, j.i, t.i, s.i, inc.i, ph.i, lev.i, st.i, out.i, x.i, tab.i, idx.i, frac.i, a.i, c.i
+  Protected attInc.i, tgt.i, dM.i, rM.i, noise.i, nval.i, isNoise.i, gl.i, gr.i, sd.i, vv.i
+  WkSegments(i, n)
+  ph = vPhase(i) : lev = vLevel(i) : st = vStage(i) : t = vT(i) : noise = vNoise(i) : nval = vNval(i)
+  attInc = 65536 : If wkI(b + #WI_A) > 0 : attInc = (65536 / (wkI(b + #WI_A) * 48)) + 1 : EndIf
+  tgt = (wkI(b + #WI_S) * 65536) / 100
+  ; the envelope's divides by d x 48 and r x 48 as an exact multiply and a
+  ; fixed shift of 44: M = ceil(2^44 / D) is exact for every numerator
+  ; below 2^19 and every length up to 65535 ms (checked at every D)
+  dM = 0 : If wkI(b + #WI_D) > 0 : dM = ((1 << 44) + (wkI(b + #WI_D) * 48) - 1) / (wkI(b + #WI_D) * 48) : EndIf
+  rM = 0 : If wkI(b + #WI_R) > 0 : rM = ((1 << 44) + (wkI(b + #WI_R) * 48) - 1) / (wkI(b + #WI_R) * 48) : EndIf
+  isNoise = 0 : If wkI(b + #WI_WAVE) = 7 : isNoise = 1 : EndIf
+  tab = wkTab + ((((wkI(b + #WI_WAVE) * 8) + PeekA(wkNoteMip + vNote(i))) * 2048) * 2)
+  gl = wkI(b + #WI_GL) : gr = wkI(b + #WI_GR) : sd = wkI(b + #WI_SEND)
+  vv = wkI(b + #WI_VOL) * vVel(i)
+  ; the per-sample loop is WkWaveLoop's assembly; it is this:
+  ;   For j = 0 To n - 1
+  ;     If (t & 31) = 0 : If j > 0 : s = s + 1 : EndIf : inc = segInc(s) : EndIf
+  ;     t = t + 1
+  ;     Select st                      ; the envelope
+  ;       Case 1 : If a <= 0 : lev = 65536 : Else : lev = lev + attInc : EndIf
+  ;                If lev >= 65536 : lev = 65536 : st = 2 : EndIf
+  ;       Case 2 : If d > 0 : lev = lev + ((tgt - lev) * 4) / (d * 48) : Else : lev = tgt : EndIf
+  ;                If tgt = 0 And lev < 64 : the voice ends here : EndIf
+  ;       Case 3 : If r > 0 : lev = lev - (lev * 4) / (r * 48) - 1 : Else : lev = 0 : EndIf
+  ;                If lev <= 64 : the voice ends here : EndIf
+  ;     EndSelect
+  ;     If isNoise
+  ;       ph = ph + inc
+  ;       If ph >= $100000000 : ph & $FFFFFFFF : the noise register steps : nval = (noise & 16383) - 8192 : EndIf
+  ;       out = nval
+  ;     Else
+  ;       idx = (ph >> 21) & 2047 : frac = (ph >> 5) & 65535
+  ;       out = tab(idx) + (((tab((idx + 1) & 2047) - tab(idx)) * frac) >> 16)
+  ;       ph = (ph + inc) & $FFFFFFFF
+  ;     EndIf
+  ;     out = (out * (lev >> 4)) >> 12
+  ;     out = (out * vol * vel) / 12700
+  ;     mixL(p0 + j) + (out * gl) >> 15 : mixR(p0 + j) + (out * gr) >> 15 : mixS(p0 + j) + (out * send) / 100
+  ;   Next
+  wkP(0) = n : wkP(1) = t : wkP(2) = segInc(0) : wkP(3) = ph : wkP(4) = lev : wkP(5) = st
+  wkP(6) = attInc : wkP(7) = tgt : wkP(8) = dM : wkP(9) = rM : wkP(10) = tab : wkP(11) = isNoise
+  wkP(12) = noise : wkP(13) = nval : wkP(14) = vv : wkP(15) = gl : wkP(16) = gr : wkP(17) = sd : wkP(18) = p0
+  wkP(19) = 0 : If wkI(b + #WI_A) <= 0 : wkP(19) = 1 : EndIf
+  WkWaveLoop()
+  t = wkP(1) : inc = wkP(2) : ph = wkP(3) : lev = wkP(4) : st = wkP(5) : noise = wkP(12) : nval = wkP(13)
+  If wkP(20) : vOn(i) = 0 : EndIf
+  vPhase(i) = ph : vLevel(i) = lev : vStage(i) = st : vT(i) = t : vNoise(i) = noise : vNval(i) = nval : vInc(i) = inc
+EndProcedure
+
+; WkRender's reverb and output loop (MuReverb, then the mix out). wkP in:
+; 0 frames, 1 the sound buffer. The combs' and all-passes' state is in their
+; own Global arrays, read and written in place.
+Procedure WkReverbLoop()
+  ASM
+    daddiu sp, sp, -80
+    sd gp, 64(sp)                ; gp is the variables' base (the compiler's): kept
+    sd s0, 0(sp)
+    sd s1, 8(sp)
+    sd s2, 16(sp)
+    sd s3, 24(sp)
+    sd s4, 32(sp)
+    sd s5, 40(sp)
+    sd s6, 48(sp)
+    sd s7, 56(sp)
+    la v1, global_wkp
+    ld k1, 0(v1)
+    ld s3, 8(v1)
+    sll s3, s3, 0
+    la t0, global_rvcomb
+    la t1, global_rvcombpos
+    la t2, global_rvcomblp
+    la t3, global_rvcomblen
+    la t8, global_rvap
+    la t9, global_rvappos
+    la gp, global_rvaplen
+    la s0, global_mixs
+    la s1, global_mixl
+    la s2, global_mixr
+    daddu k0, zero, zero
+wkr_loop:
+    beq k0, k1, wkr_done
+    nop
+    lw a0, 0(s0)
+    dsra a0, a0, 2
+    daddu a2, zero, zero
+wkr_side:
+    daddu a1, zero, zero
+    daddu a3, zero, zero
+wkr_comb:
+    dsll a4, a2, 2
+    daddu a4, a4, a3
+    dsll v0, a4, 3
+    daddu v1, t1, v0
+    ld a5, 0(v1)
+    dsll v1, a4, 11
+    daddu v1, v1, a5
+    dsll v1, v1, 1
+    daddu s4, t0, v1
+    lh a6, 0(s4)
+    daddu a1, a1, a6
+    daddu v1, t2, v0
+    ld at, 0(v1)
+    daddiu s5, zero, 26214
+    dmult a6, s5
+    mflo s5
+    nop
+    daddiu s6, zero, 6554
+    dmult at, s6
+    mflo s6
+    daddu s5, s5, s6
+    dsra s5, s5, 15
+    sd s5, 0(v1)
+    daddiu s6, zero, 27525
+    dmult s5, s6
+    mflo s6
+    dsra s6, s6, 15
+    daddu a7, a0, s6
+    slti v1, a7, 32767
+    bne v1, zero, wkr_c1
+    nop
+    daddiu a7, zero, 32767
+wkr_c1:
+    slti v1, a7, -32768
+    beq v1, zero, wkr_c2
+    nop
+    daddiu a7, zero, -32768
+wkr_c2:
+    sh a7, 0(s4)
+    daddiu a5, a5, 1
+    daddu v1, t3, v0
+    ld v1, 0(v1)
+    slt v1, a5, v1
+    bne v1, zero, wkr_c3
+    nop
+    daddu a5, zero, zero
+wkr_c3:
+    daddu v1, t1, v0
+    sd a5, 0(v1)
+    daddiu a3, a3, 1
+    slti v1, a3, 4
+    bne v1, zero, wkr_comb
+    nop
+    daddu a3, zero, zero
+wkr_ap:
+    dsll a4, a2, 1
+    daddu a4, a4, a3
+    dsll v0, a4, 3
+    daddu v1, t9, v0
+    ld a5, 0(v1)
+    dsll v1, a4, 10
+    daddu v1, v1, a5
+    dsll v1, v1, 1
+    daddu s4, t8, v1
+    lh a7, 0(s4)
+    dsubu a6, a7, a1
+    dsra a7, a7, 1
+    daddu a7, a1, a7
+    slti v1, a7, 32767
+    bne v1, zero, wkr_a1
+    nop
+    daddiu a7, zero, 32767
+wkr_a1:
+    slti v1, a7, -32768
+    beq v1, zero, wkr_a2
+    nop
+    daddiu a7, zero, -32768
+wkr_a2:
+    sh a7, 0(s4)
+    daddiu a5, a5, 1
+    daddu v1, gp, v0
+    ld v1, 0(v1)
+    slt v1, a5, v1
+    bne v1, zero, wkr_a3
+    nop
+    daddu a5, zero, zero
+wkr_a3:
+    daddu v1, t9, v0
+    sd a5, 0(v1)
+    daddu a1, a6, zero
+    daddiu a3, a3, 1
+    slti v1, a3, 2
+    bne v1, zero, wkr_ap
+    nop
+    daddiu v1, zero, 9830
+    dmult a1, v1
+    mflo v1
+    dsra v1, v1, 15
+    bne a2, zero, wkr_right
+    nop
+    lw s7, 0(s1)
+    daddu s7, s7, v1
+    j wkr_sidenext
+    nop
+wkr_right:
+    lw ra, 0(s2)
+    daddu ra, ra, v1
+wkr_sidenext:
+    daddiu a2, a2, 1
+    slti v1, a2, 2
+    bne v1, zero, wkr_side
+    nop
+    slti v1, s7, 32767
+    bne v1, zero, wkr_l1
+    nop
+    daddiu s7, zero, 32767
+wkr_l1:
+    slti v1, s7, -32768
+    beq v1, zero, wkr_l2
+    nop
+    daddiu s7, zero, -32768
+wkr_l2:
+    slti v1, ra, 32767
+    bne v1, zero, wkr_r1
+    nop
+    daddiu ra, zero, 32767
+wkr_r1:
+    slti v1, ra, -32768
+    beq v1, zero, wkr_r2
+    nop
+    daddiu ra, zero, -32768
+wkr_r2:
+    sh s7, 0(s3)
+    sh ra, 2(s3)
+    daddiu s3, s3, 4
+    daddiu s0, s0, 4
+    daddiu s1, s1, 4
+    daddiu s2, s2, 4
+    daddiu k0, k0, 1
+    j wkr_loop
+    nop
+wkr_done:
+    ld s0, 0(sp)
+    ld s1, 8(sp)
+    ld s2, 16(sp)
+    ld s3, 24(sp)
+    ld s4, 32(sp)
+    ld s5, 40(sp)
+    ld s6, 48(sp)
+    ld s7, 56(sp)
+    ld gp, 64(sp)
+    daddiu sp, sp, 80
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MuRender: `frames` stereo samples into buf, 16-bit big-endian
+; ----------------------------------------------------------------------
+; The buffer is cut where the sequencer's row counter fires: the engine
+; tests it at the start of every sample (row when it is <= 0, then a row's
+; worth added) and takes tempo x speed off after, so from a counter A > 0
+; the next row is exactly ceil(A / (tempo x speed)) samples on.
+Procedure WkRender(buf.i, frames.i)
+  Protected pos.i, k.i, ts.i, i.i, j.i, l.i, r.i, in.i, side.i, c.i, y.i, acc.i, bb.i, cp.i, ap.i, o.i
+  ts = wkTempo * wkSpeed
+  For j = 0 To frames - 1 : mixL(j) = 0 : mixR(j) = 0 : mixS(j) = 0 : Next
+  pos = 0
+  While pos < frames
+    If wkRowAcc <= 0 : WkNextRow() : wkRowAcc = wkRowAcc + (48000 * 60) : EndIf
+    k = (wkRowAcc + ts - 1) / ts
+    If k > frames - pos : k = frames - pos : EndIf
+    ; a CHUNK the data cache holds: 256 samples of the three mix lines and an
+    ; operator's output are 4 KB, so every voice adds into lines already
+    ; cached instead of streaming the whole buffer through an 8 KB cache
+    If k > #WK_CHUNK : k = #WK_CHUNK : EndIf
+    For i = 0 To #WK_VOICES - 1
+      If vOn(i)
+        If wkI(vIns(i) * 64) : WkFmBlock(i, pos, k) : Else : WkWaveBlock(i, pos, k) : EndIf
+      EndIf
+    Next
+    wkRowAcc = wkRowAcc - (k * ts)
+    pos = pos + k
+  Wend
+  ; the reverb (MuReverb, sample by sample: it is a feedback loop) and out:
+  ; WkReverbLoop's assembly, which is this loop
+  ; For j = 0 To frames - 1
+  ;   in = mixS(j) >> 2
+  ;   For side = 0 To 1
+  ;     acc = 0
+  ;     For c = 0 To 3
+  ;       i = (side * 4) + c
+  ;       cp = (i * 2048) + rvCombPos(i)
+  ;       y = rvComb(cp)
+  ;       acc = acc + y
+  ;       rvCombLp(i) = ((y * (32768 - #RV_DAMP)) + (rvCombLp(i) * #RV_DAMP)) >> 15
+  ;       bb = in + ((rvCombLp(i) * #RV_FEEDBACK) >> 15)
+  ;       If bb > 32767 : bb = 32767 : EndIf
+  ;       If bb < -32768 : bb = -32768 : EndIf
+  ;       rvComb(cp) = bb
+  ;       rvCombPos(i) = rvCombPos(i) + 1
+  ;       If rvCombPos(i) >= rvCombLen(i) : rvCombPos(i) = 0 : EndIf
+  ;     Next
+  ;     For c = 0 To 1
+  ;       i = (side * 2) + c
+  ;       ap = (i * 1024) + rvApPos(i)
+  ;       bb = rvAp(ap)
+  ;       y = bb - acc
+  ;       bb = acc + (bb >> 1)
+  ;       If bb > 32767 : bb = 32767 : EndIf
+  ;       If bb < -32768 : bb = -32768 : EndIf
+  ;       rvAp(ap) = bb
+  ;       rvApPos(i) = rvApPos(i) + 1
+  ;       If rvApPos(i) >= rvApLen(i) : rvApPos(i) = 0 : EndIf
+  ;       acc = y
+  ;     Next
+  ;     If side = 0 : l = mixL(j) + ((acc * #RV_WET) >> 15) : Else : r = mixR(j) + ((acc * #RV_WET) >> 15) : EndIf
+  ;   Next
+  ;   If l > 32767 : l = 32767 : EndIf
+  ;   If l < -32768 : l = -32768 : EndIf
+  ;   If r > 32767 : r = 32767 : EndIf
+  ;   If r < -32768 : r = -32768 : EndIf
+  ;   PokeW(buf + (j * 4), l) : PokeW(buf + (j * 4) + 2, r)
+  ; Next
+  wkP(0) = frames : wkP(1) = buf
+  WkReverbLoop()
+  wkSamples = wkSamples + frames
+  ; what is sounding now, for the screen
+  For i = 0 To 31 : wkInsActive(i) = 0 : Next
+  wkActive = 0 : wkActiveFm = 0 : wkActiveWave = 0
+  For i = 0 To #WK_VOICES - 1
+    If vOn(i)
+      wkActive = wkActive + 1
+      wkInsActive(vIns(i)) = wkInsActive(vIns(i)) + 1
+      If wkI(vIns(i) * 64) : wkActiveFm = wkActiveFm + 1 : Else : wkActiveWave = wkActiveWave + 1 : EndIf
+    EndIf
+  Next
+  If wkActive > wkPeak : wkPeak = wkActive : EndIf
+EndProcedure
+
+; Loads the song at cartridge address pi and starts it. 0 when it is not one.
+Procedure.i WkStart(pi.i)
+  If WkOpen(pi) = 0 : ProcedureReturn 0 : EndIf
+  WkReverbReset()
+  N64AudioInit(#WK_RATE)
+  wkOn = 1
+  ProcedureReturn 1
+EndProcedure
+
+; Keeps the audio interface fed: a buffer is synthesised whenever there is room.
+Global wkBuf.i
+Procedure WkPump()
+  Protected buf.i
+  If wkOn = 0 : ProcedureReturn : EndIf
+  While N64AudioFull() = 0
+    buf = #N64_AUDIO + (wkBuf * #WK_FRAMES * 4)
+    WkRender(buf, #WK_FRAMES)
+    N64AudioQueue(buf, #WK_FRAMES * 4)
+    wkBuf = wkBuf + 1
+    If wkBuf >= #WK_BUFS : wkBuf = 0 : EndIf
+  Wend
+EndProcedure

@@ -1,0 +1,865 @@
+; ======================================================================
+;  gfx_torus.rsp - the Warden's March torus, on the Nintendo 64's RSP
+; ======================================================================
+;  Assembled by PureMetal Forge's RSP assembler (.rspfile in
+;  wardens_march.n64). It shares the RSP with the music (n64.n64,
+;  N64RspUse): the CPU puts it on the RSP between two pieces of music.
+;
+;  WHAT IT DOES, for the 16 x 8 corners of the torus (InitTorus):
+;   1. turns each corner and its normal by one 3 x 3 matrix (the CPU's
+;      Turn: spin, tilt about X, tilt about Y, combined), 8 corners - one
+;      ring of the tube - per vector instruction;
+;   2. projects it: 160 + rotX x K / (rotZ + 260), and the same for Y about
+;      108, the division a reciprocal from a table the CPU sends;
+;   3. lights it from its normal (the viewer's light, up and to the left)
+;      and colours it with its ring's hue;
+;   4. keeps the quads that face the viewer (the sign of their area) and
+;      sorts them far to near by the sum of their corners' depths;
+;   5. sets up each quad's two triangles (a b c, a c d) as the RDP's
+;      shaded-triangle command - RdpShadeTriangle's 24 words: the edges and
+;      their slopes, the colour and its gradients across, down and along the
+;      major edge - 8 triangles at a time across the vector unit, and writes
+;      them to RDRAM in draw order after a count. The CPU copies them into its
+;      RDP list as they are.
+;
+;  THE DIVISIONS are a reciprocal (VRCP: 2^31 / d, 16 bits good) times a
+;  32-bit multiply on the accumulator: d x / d y = 2 dx x rcp(dy) / 65536.
+;  Every colour step is the plane's: d/dx and d/dy over the triangle's
+;  doubled area nz, and along the major edge the colour's change over its
+;  height (which is what the CPU's dy + dx hx / hy is).
+;
+;  NUMBERS: the corners' coordinates arrive x 64 (tX x 64), the normals
+;  and the matrix in Q14 and Q15; VMULF rounds where the CPU's Turn
+;  truncates, so a corner can land one pixel from where the CPU put it.
+;
+;  TASK (DMEM 0, written by the CPU): +0 the input in RDRAM (VX VY VZ NX NY
+;  NZ, 128 halves each, then the reciprocal table: 256 halves, entry i =
+;  2^23 / (i + 128), unsigned), +4 the output in RDRAM.
+;  MAT (DMEM 32): m00 m01 m02 m10 m11 m12 m20 m21, then m22, K.
+;  HUES (DMEM 64): per ring R x 256, G x 256, B x 256, 0 (unsigned halves).
+; ======================================================================
+.data
+task:   .space 32
+mat:    .space 16
+mat2:   .space 16
+hues:   .space 128
+kons:   .half 1024, 512, -27307, -13653, -10923, 410, 50, 255
+kons2:  .half 160, 108, 132, 0, 0, 0, 0, 0
+kons3:  .half 3072, 3200, 255, 1, 0, 0, 0, 0
+hdr:    .space 16
+rot:    .space 64          ; a ring turned one lane: D.x, D.y, D.z, C.z
+area:   .space 16
+depth:  .space 16
+ridx:   .space 16
+vin:    .space 512         ; VX VY VZ NX NY NZ (1536 bytes, to rcp); after the turning: the list,
+gath:   .space 240         ; a batch's corners,
+res:    .space 528         ; its triangles set up, as vectors,
+cmd:    .space 256         ; and its commands (768 bytes, to px)
+rcp:    .space 512
+px:     .space 256
+py:     .space 256
+pz:     .space 256
+cr:     .space 256
+cg:     .space 256
+cb:     .space 256
+.text
+start:
+    addiu t0, zero, mat
+    lqv $v20[0], 0(t0)
+    lqv $v21[0], 16(t0)
+    addiu t0, zero, kons
+    lqv $v31[0], 0(t0)
+    lqv $v30[0], 16(t0)
+    vxor $v0, $v0, $v0
+    addiu a0, zero, vin
+    lw a1, task+0(zero)
+    jal dmain
+    addiu a2, zero, 2048
+
+; ---- 1-3: a ring at a time ----------------------------------------------
+    addiu s0, zero, 0
+xf:
+    addiu t0, s0, vin
+    addiu t1, t0, 768
+    addiu t2, s0, px
+    addiu t3, t2, 768
+    lqv $v1[0], 0(t0)
+    lqv $v2[0], 256(t0)
+    lqv $v3[0], 512(t0)
+; the corners turned (x 64), then to whole units (>> 6)
+    vmulf $v4, $v1, $v20[0]
+    vmacf $v4, $v2, $v20[1]
+    vmacf $v4, $v3, $v20[2]
+    vmulf $v5, $v1, $v20[3]
+    vmacf $v5, $v2, $v20[4]
+    vmacf $v5, $v3, $v20[5]
+    vmulf $v6, $v1, $v20[6]
+    vmacf $v6, $v2, $v20[7]
+    vmacf $v6, $v3, $v21[0]
+    vmudm $v4, $v4, $v31[0]
+    vmudm $v5, $v5, $v31[0]
+    vmudm $v6, $v6, $v31[0]
+    sqv $v6[0], 512(t2)
+; 1 / (rotZ + 260), from the table at rotZ + 132
+    vadd $v7, $v6, $v30[2]
+    vadd $v7, $v7, $v7
+    sqv $v7[0], ridx(zero)
+    lh t8, ridx+0(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+0(zero)
+    lh t8, ridx+2(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+2(zero)
+    lh t8, ridx+4(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+4(zero)
+    lh t8, ridx+6(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+6(zero)
+    lh t8, ridx+8(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+8(zero)
+    lh t8, ridx+10(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+10(zero)
+    lh t8, ridx+12(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+12(zero)
+    lh t8, ridx+14(zero)
+    lhu t8, rcp(t8)
+    sh t8, ridx+14(zero)
+    addiu t8, zero, ridx
+    lqv $v8[0], 0(t8)
+; x: 160 + ((rotX x K) x 2^23 / dz) >> 23, in two steps of >> 16 and >> 7
+    vmudh $v9, $v4, $v21[1]
+    vmudm $v9, $v9, $v8
+    vmudm $v9, $v9, $v31[1]
+    vadd $v9, $v9, $v30[0]
+    sqv $v9[0], 0(t2)
+    vmudh $v10, $v5, $v21[1]
+    vmudm $v10, $v10, $v8
+    vmudm $v10, $v10, $v31[1]
+    vadd $v10, $v10, $v30[1]
+    sqv $v10[0], 256(t2)
+; the normals turned (Q14) and the light: max(0, -(10 z + 5 y + 4 x) / 12)
+    lqv $v1[0], 0(t1)
+    lqv $v2[0], 256(t1)
+    lqv $v3[0], 512(t1)
+    vmulf $v4, $v1, $v20[0]
+    vmacf $v4, $v2, $v20[1]
+    vmacf $v4, $v3, $v20[2]
+    vmulf $v5, $v1, $v20[3]
+    vmacf $v5, $v2, $v20[4]
+    vmacf $v5, $v3, $v20[5]
+    vmulf $v6, $v1, $v20[6]
+    vmacf $v6, $v2, $v20[7]
+    vmacf $v6, $v3, $v21[0]
+    vmulf $v7, $v6, $v31[2]
+    vmacf $v7, $v5, $v31[3]
+    vmacf $v7, $v4, $v31[4]
+    vge $v7, $v7, $v0
+; 50 + light x 205 / 16384, at most 255; then the ring's hue x that / 256
+    vmulf $v7, $v7, $v31[5]
+    vadd $v7, $v7, $v31[6]
+    vlt $v7, $v7, $v31[7]
+    srl t8, s0, 1
+    ldv $v22[0], hues(t8)
+    vmudm $v11, $v7, $v22[0]
+    vmudm $v12, $v7, $v22[1]
+    vmudm $v13, $v7, $v22[2]
+    sqv $v11[0], 0(t3)
+    sqv $v12[0], 256(t3)
+    sqv $v13[0], 512(t3)
+    addiu s0, s0, 16
+    slti t8, s0, 256
+    bne t8, zero, xf
+    nop
+
+; ---- 4: the quads facing the viewer, into the list -----------------------
+; quad (ring i, lane j): a = (i, j), b = (i+1, j), c = (i+1, j+1),
+; d = (i, j+1). D is ring i turned one lane, C ring i+1.
+    addiu s0, zero, 0
+    addiu s1, zero, vin
+    addiu s2, zero, 0
+cl:
+    addiu t2, s0, px
+    addiu t3, s0, 16
+    andi t3, t3, 255
+    addiu t3, t3, px
+    addiu a0, t2, 0
+    addiu a1, zero, rot
+    jal turn1
+    nop
+    addiu a0, t2, 256
+    addiu a1, zero, rot+16
+    jal turn1
+    nop
+    addiu a0, t2, 512
+    addiu a1, zero, rot+32
+    jal turn1
+    nop
+    addiu a0, t3, 512
+    addiu a1, zero, rot+48
+    jal turn1
+    nop
+    lqv $v1[0], 0(t2)
+    lqv $v2[0], 256(t2)
+    lqv $v3[0], 512(t2)
+    lqv $v4[0], 0(t3)
+    lqv $v5[0], 256(t3)
+    lqv $v6[0], 512(t3)
+    addiu t8, zero, rot
+    lqv $v7[0], 0(t8)
+    lqv $v8[0], 16(t8)
+    lqv $v9[0], 32(t8)
+    lqv $v10[0], 48(t8)
+; area = (b.x - a.x)(d.y - a.y) - (d.x - a.x)(b.y - a.y): its sign
+    vsub $v11, $v4, $v1
+    vsub $v12, $v8, $v2
+    vsub $v13, $v1, $v7
+    vsub $v14, $v5, $v2
+    vmudh $v15, $v11, $v12
+    vmadh $v15, $v13, $v14
+    vadd $v16, $v3, $v6
+    vadd $v16, $v16, $v9
+    vadd $v16, $v16, $v10
+    sqv $v15[0], area(zero)
+    sqv $v16[0], depth(zero)
+    addiu a3, zero, 0
+cllane:
+    lh t8, area(a3)
+    bgez t8, clnext
+    nop
+    lh t9, depth(a3)
+    sll t9, t9, 16
+    srl t8, a3, 1
+    addu t8, t8, s2
+    or t9, t9, t8
+    sw t9, 0(s1)
+    addiu s1, s1, 4
+clnext:
+    addiu a3, a3, 2
+    slti t8, a3, 16
+    bne t8, zero, cllane
+    nop
+    addiu s2, s2, 8
+    addiu s0, s0, 16
+    slti t8, s0, 256
+    bne t8, zero, cl
+    nop
+
+; ---- the list far to near: (depth << 16 | quad), largest first -----------
+    addiu s3, zero, vin+4
+sortl:
+    slt t8, s3, s1
+    beq t8, zero, sorted
+    nop
+    lw t0, 0(s3)
+    addiu t1, s3, -4
+inner:
+    slti t8, t1, vin
+    bne t8, zero, place
+    nop
+    lw t2, 0(t1)
+    slt t8, t2, t0
+    beq t8, zero, place
+    nop
+    sw t2, 4(t1)
+    j inner
+    addiu t1, t1, -4
+place:
+    sw t0, 4(t1)
+    j sortl
+    addiu s3, s3, 4
+sorted:
+
+; ---- 5: the triangles, 8 at a time ---------------------------------------
+; the sorted quads become triangles a b c and a c d; a batch's corners are
+; gathered into GATH (x y r g b of corners 1, 2, 3), set up as vectors into
+; RES (the 33 distinct halves of the command), then written out a triangle
+; at a time into CMD and sent to RDRAM.
+    addiu s3, zero, vin
+    lw s6, task+4(zero)
+    addiu s6, s6, 8
+    addiu s7, zero, 0
+    addiu t0, zero, kons3
+    lqv $v28[0], 0(t0)
+    vsub $v27, $v0, $v28[3]
+    vadd $v26, $v0, $v28[0]
+    vadd $v25, $v0, $v28[1]
+batch:
+    slt t8, s3, s1
+    beq t8, zero, done
+    nop
+; the gather, zeros first (a short last batch: degenerate triangles, skipped)
+    addiu a2, zero, gath
+    addiu t8, zero, 0
+gz:
+    addu t9, a2, t8
+    sqv $v0[0], 0(t9)
+    addiu t8, t8, 16
+    slti t9, t8, 240
+    bne t9, zero, gz
+    nop
+    addiu a3, zero, 0
+gq:
+    slt t8, s3, s1
+    beq t8, zero, gdone
+    nop
+    lw t0, 0(s3)
+    andi t0, t0, 127
+    srl t1, t0, 3
+    andi t2, t0, 7
+    addiu t3, t1, 1
+    andi t3, t3, 15
+    sll t1, t1, 3
+    sll t3, t3, 3
+    addiu t9, t2, 1
+    andi t9, t9, 7
+; a = i*8 + j (t0), b = (i+1)*8 + j (t2), c = (i+1)*8 + j+1 (t3), d = i*8 + j+1 (t1)
+    addu t0, t1, t2
+    addu t2, t3, t2
+    addu t3, t3, t9
+    addu t1, t1, t9
+; lane a3/2: a b c; the next lane: a c d
+    addu a0, t0, zero
+    jal gcorner
+    addiu a1, a3, gath
+    addu a0, t2, zero
+    jal gcorner
+    addiu a1, a3, gath+80
+    addu a0, t3, zero
+    jal gcorner
+    addiu a1, a3, gath+160
+    addu a0, t0, zero
+    jal gcorner
+    addiu a1, a3, gath+2
+    addu a0, t3, zero
+    jal gcorner
+    addiu a1, a3, gath+82
+    addu a0, t1, zero
+    jal gcorner
+    addiu a1, a3, gath+162
+    addiu s3, s3, 4
+    addiu a3, a3, 4
+    slti t8, a3, 16
+    bne t8, zero, gq
+    nop
+gdone:
+    lqv $v1[0], 0(a2)
+    lqv $v2[0], 16(a2)
+    lqv $v3[0], 32(a2)
+    lqv $v4[0], 48(a2)
+    lqv $v5[0], 64(a2)
+    lqv $v6[0], 80(a2)
+    lqv $v7[0], 96(a2)
+    lqv $v8[0], 112(a2)
+    lqv $v9[0], 128(a2)
+    lqv $v10[0], 144(a2)
+    lqv $v11[0], 160(a2)
+    lqv $v12[0], 176(a2)
+    lqv $v13[0], 192(a2)
+    lqv $v14[0], 208(a2)
+    lqv $v15[0], 224(a2)
+; top to bottom: RdpShadeTriangle's three exchanges
+    vlt $v29, $v7, $v2
+    vmrg $v16, $v1, $v6
+    vmrg $v1, $v6, $v1
+    vor $v6, $v16, $v0
+    vmrg $v16, $v2, $v7
+    vmrg $v2, $v7, $v2
+    vor $v7, $v16, $v0
+    vmrg $v16, $v3, $v8
+    vmrg $v3, $v8, $v3
+    vor $v8, $v16, $v0
+    vmrg $v16, $v4, $v9
+    vmrg $v4, $v9, $v4
+    vor $v9, $v16, $v0
+    vmrg $v16, $v5, $v10
+    vmrg $v5, $v10, $v5
+    vor $v10, $v16, $v0
+    vlt $v29, $v12, $v7
+    vmrg $v16, $v6, $v11
+    vmrg $v6, $v11, $v6
+    vor $v11, $v16, $v0
+    vmrg $v16, $v7, $v12
+    vmrg $v7, $v12, $v7
+    vor $v12, $v16, $v0
+    vmrg $v16, $v8, $v13
+    vmrg $v8, $v13, $v8
+    vor $v13, $v16, $v0
+    vmrg $v16, $v9, $v14
+    vmrg $v9, $v14, $v9
+    vor $v14, $v16, $v0
+    vmrg $v16, $v10, $v15
+    vmrg $v10, $v15, $v10
+    vor $v15, $v16, $v0
+    vlt $v29, $v7, $v2
+    vmrg $v16, $v1, $v6
+    vmrg $v1, $v6, $v1
+    vor $v6, $v16, $v0
+    vmrg $v16, $v2, $v7
+    vmrg $v2, $v7, $v2
+    vor $v7, $v16, $v0
+    vmrg $v16, $v3, $v8
+    vmrg $v3, $v8, $v3
+    vor $v8, $v16, $v0
+    vmrg $v16, $v4, $v9
+    vmrg $v4, $v9, $v4
+    vor $v9, $v16, $v0
+    vmrg $v16, $v5, $v10
+    vmrg $v5, $v10, $v5
+    vor $v10, $v16, $v0
+    addiu a2, zero, res
+; the edges: H 1-3, M 1-2, L 2-3
+    vsub $v16, $v11, $v1
+    vsub $v17, $v12, $v2
+    vsub $v18, $v6, $v1
+    vsub $v19, $v7, $v2
+    vsub $v20, $v11, $v6
+    vsub $v21, $v12, $v7
+; nz = hx my - hy mx, 32 bits (v22 high, v23 low)
+    vsub $v24, $v0, $v18
+    vmudh $v29, $v16, $v19
+    vmadh $v29, $v17, $v24
+    vsar $v22, $v22, $v0[0]
+    vsar $v23, $v23, $v0[1]
+; word 0, high half: the command, left-major when nz < 0 - and 0, "skip", when nz = 0
+    vlt $v29, $v22, $v0
+    vmrg $v24, $v25, $v26
+    vor $v29, $v22, $v23
+    veq $v29, $v29, $v0
+    vmrg $v24, $v0, $v24
+    sqv $v24[0], 0(a2)
+; the y of the corners x 4 (s11.2), the x of corners 2 and 1, colour 1
+    vadd $v24, $v12, $v12
+    vadd $v24, $v24, $v24
+    sqv $v24[0], 16(a2)
+    vadd $v24, $v7, $v7
+    vadd $v24, $v24, $v24
+    sqv $v24[0], 32(a2)
+    vadd $v24, $v2, $v2
+    vadd $v24, $v24, $v24
+    sqv $v24[0], 48(a2)
+    sqv $v6[0], 64(a2)
+    sqv $v1[0], 80(a2)
+    sqv $v3[0], 96(a2)
+    sqv $v4[0], 112(a2)
+    sqv $v5[0], 128(a2)
+; each channel's change to corner 3 and corner 2, doubled: R v1 v2, G v6 v7, B v11 v12
+    vsub $v1, $v13, $v3
+    vadd $v1, $v1, $v1
+    vsub $v2, $v8, $v3
+    vadd $v2, $v2, $v2
+    vsub $v6, $v14, $v4
+    vadd $v6, $v6, $v6
+    vsub $v7, $v9, $v4
+    vadd $v7, $v7, $v7
+    vsub $v11, $v15, $v5
+    vadd $v11, $v11, $v11
+    vsub $v12, $v10, $v5
+    vadd $v12, $v12, $v12
+; the reciprocals: hy v3:v4, my v5:v8, ly v9:v10 (0 where a height is 0), nz v13:v14
+    vrcp $v4, $v0, $v17[0]
+    vrcph $v3, $v0, $v17[0]
+    vrcp $v4, $v1, $v17[1]
+    vrcph $v3, $v1, $v17[1]
+    vrcp $v4, $v2, $v17[2]
+    vrcph $v3, $v2, $v17[2]
+    vrcp $v4, $v3, $v17[3]
+    vrcph $v3, $v3, $v17[3]
+    vrcp $v4, $v4, $v17[4]
+    vrcph $v3, $v4, $v17[4]
+    vrcp $v4, $v5, $v17[5]
+    vrcph $v3, $v5, $v17[5]
+    vrcp $v4, $v6, $v17[6]
+    vrcph $v3, $v6, $v17[6]
+    vrcp $v4, $v7, $v17[7]
+    vrcph $v3, $v7, $v17[7]
+    vrcp $v8, $v0, $v19[0]
+    vrcph $v5, $v0, $v19[0]
+    vrcp $v8, $v1, $v19[1]
+    vrcph $v5, $v1, $v19[1]
+    vrcp $v8, $v2, $v19[2]
+    vrcph $v5, $v2, $v19[2]
+    vrcp $v8, $v3, $v19[3]
+    vrcph $v5, $v3, $v19[3]
+    vrcp $v8, $v4, $v19[4]
+    vrcph $v5, $v4, $v19[4]
+    vrcp $v8, $v5, $v19[5]
+    vrcph $v5, $v5, $v19[5]
+    vrcp $v8, $v6, $v19[6]
+    vrcph $v5, $v6, $v19[6]
+    vrcp $v8, $v7, $v19[7]
+    vrcph $v5, $v7, $v19[7]
+    veq $v29, $v19, $v0
+    vmrg $v5, $v0, $v5
+    vmrg $v8, $v0, $v8
+    vrcp $v10, $v0, $v21[0]
+    vrcph $v9, $v0, $v21[0]
+    vrcp $v10, $v1, $v21[1]
+    vrcph $v9, $v1, $v21[1]
+    vrcp $v10, $v2, $v21[2]
+    vrcph $v9, $v2, $v21[2]
+    vrcp $v10, $v3, $v21[3]
+    vrcph $v9, $v3, $v21[3]
+    vrcp $v10, $v4, $v21[4]
+    vrcph $v9, $v4, $v21[4]
+    vrcp $v10, $v5, $v21[5]
+    vrcph $v9, $v5, $v21[5]
+    vrcp $v10, $v6, $v21[6]
+    vrcph $v9, $v6, $v21[6]
+    vrcp $v10, $v7, $v21[7]
+    vrcph $v9, $v7, $v21[7]
+    veq $v29, $v21, $v0
+    vmrg $v9, $v0, $v9
+    vmrg $v10, $v0, $v10
+    vrcph $v29, $v0, $v22[0]
+    vrcpl $v14, $v0, $v23[0]
+    vrcph $v13, $v0, $v22[0]
+    vrcph $v29, $v1, $v22[1]
+    vrcpl $v14, $v1, $v23[1]
+    vrcph $v13, $v1, $v22[1]
+    vrcph $v29, $v2, $v22[2]
+    vrcpl $v14, $v2, $v23[2]
+    vrcph $v13, $v2, $v22[2]
+    vrcph $v29, $v3, $v22[3]
+    vrcpl $v14, $v3, $v23[3]
+    vrcph $v13, $v3, $v22[3]
+    vrcph $v29, $v4, $v22[4]
+    vrcpl $v14, $v4, $v23[4]
+    vrcph $v13, $v4, $v22[4]
+    vrcph $v29, $v5, $v22[5]
+    vrcpl $v14, $v5, $v23[5]
+    vrcph $v13, $v5, $v22[5]
+    vrcph $v29, $v6, $v22[6]
+    vrcpl $v14, $v6, $v23[6]
+    vrcph $v13, $v6, $v22[6]
+    vrcph $v29, $v7, $v22[7]
+    vrcpl $v14, $v7, $v23[7]
+    vrcph $v13, $v7, $v22[7]
+; the edge slopes, dx / dy in 16.16: L (words 3), H (5), M (7)
+    vadd $v24, $v20, $v20
+    vlt $v29, $v24, $v0
+    vmrg $v28, $v27, $v0
+    vmudl $v29, $v24, $v10
+    vmadm $v29, $v28, $v10
+    vmadn $v29, $v24, $v9
+    vmadh $v29, $v28, $v9
+    vsar $v22, $v22, $v0[1]
+    vsar $v23, $v23, $v0[2]
+    sqv $v22[0], 144(a2)
+    sqv $v23[0], 160(a2)
+    vadd $v24, $v16, $v16
+    vlt $v29, $v24, $v0
+    vmrg $v28, $v27, $v0
+    vmudl $v29, $v24, $v4
+    vmadm $v29, $v28, $v4
+    vmadn $v29, $v24, $v3
+    vmadh $v29, $v28, $v3
+    vsar $v22, $v22, $v0[1]
+    vsar $v23, $v23, $v0[2]
+    sqv $v22[0], 176(a2)
+    sqv $v23[0], 192(a2)
+    vadd $v24, $v18, $v18
+    vlt $v29, $v24, $v0
+    vmrg $v28, $v27, $v0
+    vmudl $v29, $v24, $v8
+    vmadm $v29, $v28, $v8
+    vmadn $v29, $v24, $v5
+    vmadh $v29, $v28, $v5
+    vsar $v22, $v22, $v0[1]
+    vsar $v23, $v23, $v0[2]
+    sqv $v22[0], 208(a2)
+    sqv $v23[0], 224(a2)
+; -hy and -mx, for the colour planes
+    vsub $v20, $v0, $v17
+    vsub $v21, $v0, $v18
+; R: d/dx = 65536 (my ha - hy ma) / nz, d/dy = 65536 (ma hx - ha mx) / nz, along H: 65536 ha / hy
+    vmudh $v29, $v19, $v1
+    vmadh $v29, $v20, $v2
+    vsar $v22, $v22, $v0[0]
+    vsar $v23, $v23, $v0[1]
+    vmudl $v29, $v23, $v14
+    vmadm $v29, $v22, $v14
+    vmadn $v29, $v23, $v13
+    vmadh $v29, $v22, $v13
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 240(a2)
+    sqv $v24[0], 288(a2)
+    vmudh $v29, $v2, $v16
+    vmadh $v29, $v1, $v21
+    vsar $v22, $v22, $v0[0]
+    vsar $v23, $v23, $v0[1]
+    vmudl $v29, $v23, $v14
+    vmadm $v29, $v22, $v14
+    vmadn $v29, $v23, $v13
+    vmadh $v29, $v22, $v13
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 384(a2)
+    sqv $v24[0], 480(a2)
+    vlt $v29, $v1, $v0
+    vmrg $v28, $v27, $v0
+    vmudl $v29, $v1, $v4
+    vmadm $v29, $v28, $v4
+    vmadn $v29, $v1, $v3
+    vmadh $v29, $v28, $v3
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 336(a2)
+    sqv $v24[0], 432(a2)
+; G: d/dx = 65536 (my ha - hy ma) / nz, d/dy = 65536 (ma hx - ha mx) / nz, along H: 65536 ha / hy
+    vmudh $v29, $v19, $v6
+    vmadh $v29, $v20, $v7
+    vsar $v22, $v22, $v0[0]
+    vsar $v23, $v23, $v0[1]
+    vmudl $v29, $v23, $v14
+    vmadm $v29, $v22, $v14
+    vmadn $v29, $v23, $v13
+    vmadh $v29, $v22, $v13
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 256(a2)
+    sqv $v24[0], 304(a2)
+    vmudh $v29, $v7, $v16
+    vmadh $v29, $v6, $v21
+    vsar $v22, $v22, $v0[0]
+    vsar $v23, $v23, $v0[1]
+    vmudl $v29, $v23, $v14
+    vmadm $v29, $v22, $v14
+    vmadn $v29, $v23, $v13
+    vmadh $v29, $v22, $v13
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 400(a2)
+    sqv $v24[0], 496(a2)
+    vlt $v29, $v6, $v0
+    vmrg $v28, $v27, $v0
+    vmudl $v29, $v6, $v4
+    vmadm $v29, $v28, $v4
+    vmadn $v29, $v6, $v3
+    vmadh $v29, $v28, $v3
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 352(a2)
+    sqv $v24[0], 448(a2)
+; B: d/dx = 65536 (my ha - hy ma) / nz, d/dy = 65536 (ma hx - ha mx) / nz, along H: 65536 ha / hy
+    vmudh $v29, $v19, $v11
+    vmadh $v29, $v20, $v12
+    vsar $v22, $v22, $v0[0]
+    vsar $v23, $v23, $v0[1]
+    vmudl $v29, $v23, $v14
+    vmadm $v29, $v22, $v14
+    vmadn $v29, $v23, $v13
+    vmadh $v29, $v22, $v13
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 272(a2)
+    sqv $v24[0], 320(a2)
+    vmudh $v29, $v12, $v16
+    vmadh $v29, $v11, $v21
+    vsar $v22, $v22, $v0[0]
+    vsar $v23, $v23, $v0[1]
+    vmudl $v29, $v23, $v14
+    vmadm $v29, $v22, $v14
+    vmadn $v29, $v23, $v13
+    vmadh $v29, $v22, $v13
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 416(a2)
+    sqv $v24[0], 512(a2)
+    vlt $v29, $v11, $v0
+    vmrg $v28, $v27, $v0
+    vmudl $v29, $v11, $v4
+    vmadm $v29, $v28, $v4
+    vmadn $v29, $v11, $v3
+    vmadh $v29, $v28, $v3
+    vsar $v15, $v15, $v0[1]
+    vsar $v24, $v24, $v0[2]
+    sqv $v15[0], 368(a2)
+    sqv $v24[0], 464(a2)
+; ---- the batch's triangles out, those with an area ------------------------
+    addiu s4, zero, cmd
+    addiu s5, zero, 0
+    addiu t9, zero, 255
+    addiu a3, zero, 0
+sl:
+    lh t8, res+0(a3)
+    beq t8, zero, snext
+    nop
+    lh t8, res+0(a3)
+    sh t8, 0(s4)
+    lh t8, res+16(a3)
+    sh t8, 2(s4)
+    lh t8, res+32(a3)
+    sh t8, 4(s4)
+    lh t8, res+48(a3)
+    sh t8, 6(s4)
+    lh t8, res+64(a3)
+    sh t8, 8(s4)
+    sh zero, 10(s4)
+    lh t8, res+144(a3)
+    sh t8, 12(s4)
+    lh t8, res+160(a3)
+    sh t8, 14(s4)
+    lh t8, res+80(a3)
+    sh t8, 16(s4)
+    sh zero, 18(s4)
+    lh t8, res+176(a3)
+    sh t8, 20(s4)
+    lh t8, res+192(a3)
+    sh t8, 22(s4)
+    lh t8, res+80(a3)
+    sh t8, 24(s4)
+    sh zero, 26(s4)
+    lh t8, res+208(a3)
+    sh t8, 28(s4)
+    lh t8, res+224(a3)
+    sh t8, 30(s4)
+    lh t8, res+96(a3)
+    sh t8, 32(s4)
+    lh t8, res+112(a3)
+    sh t8, 34(s4)
+    lh t8, res+128(a3)
+    sh t8, 36(s4)
+    sh t9, 38(s4)
+    lh t8, res+240(a3)
+    sh t8, 40(s4)
+    lh t8, res+256(a3)
+    sh t8, 42(s4)
+    lh t8, res+272(a3)
+    sh t8, 44(s4)
+    sh zero, 46(s4)
+    sh zero, 48(s4)
+    sh zero, 50(s4)
+    sh zero, 52(s4)
+    sh zero, 54(s4)
+    lh t8, res+288(a3)
+    sh t8, 56(s4)
+    lh t8, res+304(a3)
+    sh t8, 58(s4)
+    lh t8, res+320(a3)
+    sh t8, 60(s4)
+    sh zero, 62(s4)
+    lh t8, res+336(a3)
+    sh t8, 64(s4)
+    lh t8, res+352(a3)
+    sh t8, 66(s4)
+    lh t8, res+368(a3)
+    sh t8, 68(s4)
+    sh zero, 70(s4)
+    lh t8, res+384(a3)
+    sh t8, 72(s4)
+    lh t8, res+400(a3)
+    sh t8, 74(s4)
+    lh t8, res+416(a3)
+    sh t8, 76(s4)
+    sh zero, 78(s4)
+    lh t8, res+432(a3)
+    sh t8, 80(s4)
+    lh t8, res+448(a3)
+    sh t8, 82(s4)
+    lh t8, res+464(a3)
+    sh t8, 84(s4)
+    sh zero, 86(s4)
+    lh t8, res+480(a3)
+    sh t8, 88(s4)
+    lh t8, res+496(a3)
+    sh t8, 90(s4)
+    lh t8, res+512(a3)
+    sh t8, 92(s4)
+    sh zero, 94(s4)
+    addiu s4, s4, 96
+    addiu s5, s5, 1
+snext:
+    addiu a3, a3, 2
+    slti t8, a3, 16
+    bne t8, zero, sl
+    nop
+    beq s5, zero, batch
+    nop
+    sll t0, s5, 6
+    sll t1, s5, 5
+    addu a2, t0, t1
+    addiu a0, zero, cmd
+    addu a1, s6, zero
+    jal dmaout
+    addu s6, s6, a2
+    j batch
+    addu s7, s7, s5
+done:
+    sw s7, hdr+0(zero)
+    sw zero, hdr+4(zero)
+    addiu a0, zero, hdr
+    lw a1, task+4(zero)
+    jal dmaout
+    addiu a2, zero, 8
+    break
+    nop
+
+; a0 = a corner (0-127): its x y r g b to a1, a1 + 16 .. a1 + 64
+gcorner:
+    sll a0, a0, 1
+    lh t8, px(a0)
+    sh t8, 0(a1)
+    lh t8, py(a0)
+    sh t8, 16(a1)
+    lh t8, cr(a0)
+    sh t8, 32(a1)
+    lh t8, cg(a0)
+    sh t8, 48(a1)
+    lh t8, cb(a0)
+    jr ra
+    sh t8, 64(a1)
+
+; the 8 halves at a0, turned one lane (lane j gets lane j+1), to a1
+turn1:
+    lh t8, 2(a0)
+    sh t8, 0(a1)
+    lh t8, 4(a0)
+    sh t8, 2(a1)
+    lh t8, 6(a0)
+    sh t8, 4(a1)
+    lh t8, 8(a0)
+    sh t8, 6(a1)
+    lh t8, 10(a0)
+    sh t8, 8(a1)
+    lh t8, 12(a0)
+    sh t8, 10(a1)
+    lh t8, 14(a0)
+    sh t8, 12(a1)
+    lh t8, 0(a0)
+    jr ra
+    sh t8, 14(a1)
+
+; ---- DMA: a0 DMEM, a1 RDRAM, a2 bytes (a multiple of 8) ---------------
+dmain:
+    mfc0 t8, $6
+    bne t8, zero, dmain
+    nop
+    mtc0 a0, $0
+    mtc0 a1, $1
+    addiu t8, a2, -1
+    mtc0 t8, $2
+dmainw:
+    mfc0 t8, $6
+    bne t8, zero, dmainw
+    nop
+    jr ra
+    nop
+dmaout:
+    mfc0 t8, $6
+    bne t8, zero, dmaout
+    nop
+    mtc0 a0, $0
+    mtc0 a1, $1
+    addiu t8, a2, -1
+    mtc0 t8, $3
+dmaoutw:
+    mfc0 t8, $6
+    bne t8, zero, dmaoutw
+    nop
+    jr ra
+    nop
