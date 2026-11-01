@@ -40,6 +40,8 @@ if ((Test-Path $WardensKey) -and (Test-Path $HostCompiler)) {
 }
 & python make_assets.py
 if ($LASTEXITCODE -ne 0) { throw "make_assets.py failed" }
-& $Forge --compile wardens_march.n64 -o WardensMarch.bin
-if ($LASTEXITCODE -ne 0) { throw "the demo did not compile" }
+# (Forge is a windowed program: PowerShell does not wait for it or see its exit code
+# unless started this way)
+$fp = Start-Process -FilePath $Forge -ArgumentList '--compile','wardens_march.n64','-o','WardensMarch.bin' -NoNewWindow -Wait -PassThru
+if ($fp.ExitCode -ne 0) { throw "the demo did not compile" }
 "built " + (Join-Path $PSScriptRoot "WardensMarch.z64")

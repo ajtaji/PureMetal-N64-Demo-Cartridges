@@ -16,6 +16,8 @@ $v = Get-Content $vf
 $v = $v | ForEach-Object { if ($_ -match '^#DEMO_BUILD = (\d+)') { "#DEMO_BUILD = " + ([int]$Matches[1] + 1) } else { $_ } }
 Set-Content -Path $vf -Value $v -Encoding ASCII
 "build " + (($v | Select-String '^#DEMO_MAJOR = (\d+)').Matches[0].Groups[1].Value) + "." + (($v | Select-String '^#DEMO_MINOR = (\d+)').Matches[0].Groups[1].Value) + "." + (($v | Select-String '^#DEMO_BUILD = (\d+)').Matches[0].Groups[1].Value)
-& $Forge --compile demo.n64 -o PureMetalDemo.bin
-if ($LASTEXITCODE -ne 0) { throw "the demo did not compile" }
+# (Forge is a windowed program: PowerShell does not wait for it or see its exit code
+# unless started this way)
+$fp = Start-Process -FilePath $Forge -ArgumentList '--compile','demo.n64','-o','PureMetalDemo.bin' -NoNewWindow -Wait -PassThru
+if ($fp.ExitCode -ne 0) { throw "the demo did not compile" }
 "built " + (Join-Path $PSScriptRoot "PureMetalDemo.z64")

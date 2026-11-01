@@ -1,4 +1,4 @@
 ; version.n64 - the version on screen. build.ps1 raises the build number on every build.
 #DEMO_MAJOR = 1
 #DEMO_MINOR = 1
-#DEMO_BUILD = 3
+#DEMO_BUILD = 4
