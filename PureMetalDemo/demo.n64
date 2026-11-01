@@ -1,0 +1,366 @@
+; ======================================================================
+;  demo.n64 - a PureMetal demo for the Nintendo 64
+; ======================================================================
+;  Built by PureMetal Forge for the VR4300 (the Nintendo 64 board):
+;      PureMetalForge.exe --compile demo.n64 -o PureMetalDemo.bin
+;  writes PureMetalDemo.z64, a cartridge image with the compiler's own boot code.
+;
+;  Copper-style colour bars, a three-speed starfield, two flat-shaded 3D
+;  objects lit by their faces' angle to the viewer (a cube, and an octahedron
+;  going round it), a colour-cycling title, a sine-wave scroller, and a
+;  four-voice synthesiser - pulse lead, saw arpeggio, square bass and drums -
+;  playing an original tune through the audio interface.
+;
+;  Every table it reads (sine, font, note steps, the song, the message) is in
+;  demo_assets.n64, written by make_demo_assets.py.
+; ======================================================================
+XIncludeFile "Mips/Lib/n64.n64"
+XIncludeFile "demo_assets.n64"
+
+#STARS = 48
+#AUDIO_SAMPLES = 368                    ; a buffer: 368 stereo samples, 1472 bytes
+#AUDIO_BYTES = #AUDIO_SAMPLES * 4
+#AUDIO_BUFS = 3
+
+Global frame.i
+Global Dim starX.i(#STARS)
+Global Dim starY.i(#STARS)
+Global Dim starV.i(#STARS)
+Global rnd.i = 12345
+
+; the 3D work: rotated and projected corners
+Global Dim px.i(8)
+Global Dim py.i(8)
+Global Dim pz.i(8)
+
+; the synthesiser
+Global row.i, rowSample.i, audioBuf.i
+Global leadPhase.i, leadInc.i, leadEnv.i
+Global arpPhase.i, arpInc.i, arpEnv.i
+Global bassPhase.i, bassInc.i, bassEnv.i
+Global kickPhase.i, kickInc.i, kickEnv.i, noiseEnv.i, noiseDecay.i, lfsr.i = $ACE1
+
+; ----------------------------------------------------------------------
+;  small helpers
+; ----------------------------------------------------------------------
+Procedure.i Sin14(a.i)                  ; sin, 256 steps a turn, scaled 16384
+  ProcedureReturn PeekW(?SinTab + ((a & 255) * 2))
+EndProcedure
+
+Procedure.i Cos14(a.i)
+  ProcedureReturn PeekW(?SinTab + (((a + 64) & 255) * 2))
+EndProcedure
+
+Procedure.i Random16()                  ; xorshift, 16 bits of it
+  rnd = rnd ! ((rnd << 13) & $FFFFFFFF)
+  rnd = rnd ! (rnd >> 17)
+  rnd = rnd ! ((rnd << 5) & $FFFFFFFF)
+  rnd = rnd & $FFFFFFFF
+  ProcedureReturn rnd & $FFFF
+EndProcedure
+
+; a colour from a hue 0-255 (six ramps) at full saturation
+Procedure.i Hue16(h.i)
+  Protected r.i, g.i, b.i, k.i
+  h = h & 255
+  k = (h % 43) * 6
+  Select h / 43
+    Case 0 : r = 255 : g = k : b = 0
+    Case 1 : r = 255 - k : g = 255 : b = 0
+    Case 2 : r = 0 : g = 255 : b = k
+    Case 3 : r = 0 : g = 255 - k : b = 255
+    Case 4 : r = k : g = 0 : b = 255
+    Default : r = 255 : g = 0 : b = 255 - k
+  EndSelect
+  ProcedureReturn N64Rgb16(r, g, b)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  text: an 8x8 glyph drawn with fill rectangles, `scale` pixels a dot
+; ----------------------------------------------------------------------
+Procedure DrawGlyph(c.i, x.i, y.i, scale.i)
+  Protected rowI.i, bits.i, col.i, g.i
+  If c < 32 Or c > 95 : ProcedureReturn : EndIf
+  If x > #N64_W Or x < -8 * scale : ProcedureReturn : EndIf
+  g = ?Font + ((c - 32) * 8)
+  For rowI = 0 To 7
+    bits = PeekA(g + rowI)
+    If bits <> 0
+      For col = 0 To 7
+        If (bits & ($80 >> col)) <> 0
+          RdpFillRect(x + (col * scale), y + (rowI * scale), x + (col * scale) + scale - 1, y + (rowI * scale) + scale - 1)
+        EndIf
+      Next
+    EndIf
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  the background: horizontal bars sliding through the colours, a floor
+; ----------------------------------------------------------------------
+Procedure DrawBackground()
+  Protected i.i, y.i, shade.i
+  For i = 0 To 29
+    y = i * 8
+    shade = 40 + ((Sin14((i * 9) + (frame * 2)) + 16384) >> 10)
+    RdpFillColor(N64Rgb16(shade >> 3, shade >> 2, shade))
+    RdpFillRect(0, y, 319, y + 7)
+  Next
+  ; two bright copper bars bouncing
+  For i = 0 To 1
+    y = 100 + ((Sin14((frame * 3) + (i * 128)) * 70) >> 14)
+    RdpFillColor(Hue16((frame * 2) + (i * 100)))
+    RdpFillRect(0, y, 319, y + 3)
+    RdpFillColor(N64Rgb16(255, 255, 255))
+    RdpFillRect(0, y + 4, 319, y + 4)
+  Next
+EndProcedure
+
+Procedure InitStars()
+  Protected i.i
+  For i = 0 To #STARS - 1
+    starX(i) = Random16() % 320
+    starY(i) = Random16() % 240
+    starV(i) = 1 + (i % 3)
+  Next
+EndProcedure
+
+Procedure DrawStars()
+  Protected i.i, c.i
+  For i = 0 To #STARS - 1
+    starX(i) = starX(i) - starV(i)
+    If starX(i) < 0
+      starX(i) = starX(i) + 320
+      starY(i) = Random16() % 240
+    EndIf
+    c = 80 + (starV(i) * 58)
+    RdpFillColor(N64Rgb16(c, c, c))
+    RdpFillRect(starX(i), starY(i), starX(i) + starV(i) - 1, starY(i) + starV(i) - 1)
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  3D: rotate the corners (Y then X), project them, draw the faces that
+;  face the viewer, each lit by how squarely it does
+; ----------------------------------------------------------------------
+Procedure Project(i.i, x.i, y.i, z.i, ay.i, ax.i, cx.i, cy.i, cz.i)
+  Protected x1.i, z1.i, y2.i, z2.i, d.i
+  x1 = ((x * Cos14(ay)) + (z * Sin14(ay))) >> 14
+  z1 = ((z * Cos14(ay)) - (x * Sin14(ay))) >> 14
+  y2 = ((y * Cos14(ax)) - (z1 * Sin14(ax))) >> 14
+  z2 = ((y * Sin14(ax)) + (z1 * Cos14(ax))) >> 14
+  d = z2 + cz
+  If d < 40 : d = 40 : EndIf
+  px(i) = cx + ((x1 * 220) / d)
+  py(i) = cy + ((y2 * 220) / d)
+  pz(i) = z2
+EndProcedure
+
+; a face (a, b, c) if it faces the viewer: lit by its screen-space area
+; against its full size (a face square-on is brightest)
+Procedure Face(a.i, b.i, c.i, r.i, g.i, bl.i, full.i)
+  Protected area.i, lit.i
+  area = ((px(b) - px(a)) * (py(c) - py(a))) - ((px(c) - px(a)) * (py(b) - py(a)))
+  If area <= 0 : ProcedureReturn : EndIf
+  lit = 64 + ((area * 192) / full)
+  If lit > 255 : lit = 255 : EndIf
+  RdpPrimColor((r * lit) >> 8, (g * lit) >> 8, (bl * lit) >> 8)
+  RdpTriangle(px(a), py(a), px(b), py(b), px(c), py(c))
+EndProcedure
+
+Procedure DrawCube(cx.i, cy.i, cz.i, ay.i, ax.i, s.i)
+  Project(0, -s, -s, -s, ay, ax, cx, cy, cz)
+  Project(1, s, -s, -s, ay, ax, cx, cy, cz)
+  Project(2, s, s, -s, ay, ax, cx, cy, cz)
+  Project(3, -s, s, -s, ay, ax, cx, cy, cz)
+  Project(4, -s, -s, s, ay, ax, cx, cy, cz)
+  Project(5, s, -s, s, ay, ax, cx, cy, cz)
+  Project(6, s, s, s, ay, ax, cx, cy, cz)
+  Project(7, -s, s, s, ay, ax, cx, cy, cz)
+  Protected full.i = (s * s * 220 * 220 * 4) / (cz * cz)   ; a face's area square-on, roughly
+  If full < 1 : full = 1 : EndIf
+  Face(0, 1, 2, 255, 80, 40, full) : Face(0, 2, 3, 255, 80, 40, full)        ; front
+  Face(5, 4, 7, 255, 80, 40, full) : Face(5, 7, 6, 255, 80, 40, full)        ; back
+  Face(4, 0, 3, 60, 200, 255, full) : Face(4, 3, 7, 60, 200, 255, full)      ; left
+  Face(1, 5, 6, 60, 200, 255, full) : Face(1, 6, 2, 60, 200, 255, full)      ; right
+  Face(4, 5, 1, 255, 220, 60, full) : Face(4, 1, 0, 255, 220, 60, full)      ; top
+  Face(3, 2, 6, 255, 220, 60, full) : Face(3, 6, 7, 255, 220, 60, full)      ; bottom
+EndProcedure
+
+Procedure DrawOcta(cx.i, cy.i, cz.i, ay.i, ax.i, s.i)
+  Project(0, 0, -s, 0, ay, ax, cx, cy, cz)
+  Project(1, 0, s, 0, ay, ax, cx, cy, cz)
+  Project(2, -s, 0, 0, ay, ax, cx, cy, cz)
+  Project(3, s, 0, 0, ay, ax, cx, cy, cz)
+  Project(4, 0, 0, -s, ay, ax, cx, cy, cz)
+  Project(5, 0, 0, s, ay, ax, cx, cy, cz)
+  Protected full.i = (s * s * 220 * 220) / (cz * cz)
+  If full < 1 : full = 1 : EndIf
+  Face(0, 3, 4, 200, 60, 255, full) : Face(0, 4, 2, 120, 255, 120, full)
+  Face(0, 2, 5, 200, 60, 255, full) : Face(0, 5, 3, 120, 255, 120, full)
+  Face(1, 4, 3, 120, 255, 120, full) : Face(1, 2, 4, 200, 60, 255, full)
+  Face(1, 5, 2, 120, 255, 120, full) : Face(1, 3, 5, 200, 60, 255, full)
+EndProcedure
+
+Procedure DrawObjects()
+  Protected ox.i, oz.i, cubeZ.i = 300, octZ.i
+  ox = (Sin14(frame * 2) * 120) >> 14
+  oz = (Cos14(frame * 2) * 120) >> 14
+  octZ = cubeZ + oz
+  RdpFlatMode()
+  ; the far one first
+  If octZ > cubeZ
+    DrawOcta(160 + ((ox * 220) / octZ), 110, octZ, frame * 3, frame * 2, 40)
+    DrawCube(160, 110, cubeZ, frame * 2, frame, 52)
+  Else
+    DrawCube(160, 110, cubeZ, frame * 2, frame, 52)
+    DrawOcta(160 + ((ox * 220) / octZ), 110, octZ, frame * 3, frame * 2, 40)
+  EndIf
+  RdpFillMode()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  the title and the scroller
+; ----------------------------------------------------------------------
+Procedure DrawTitle()
+  Protected i.i, c.i, x.i
+  ; "PUREMETAL", 3x, each letter its own colour, the colours walking
+  For i = 0 To 8
+    c = PeekA(?TitleText + i)
+    x = 24 + (i * 30)
+    RdpFillColor(Hue16((frame * 3) + (i * 28)))
+    DrawGlyph(c, x, 8 + ((Sin14((frame * 4) + (i * 24)) * 4) >> 14), 3)
+  Next
+EndProcedure
+
+Procedure DrawScroller()
+  Protected i.i, c.i, x.i, y.i, start.i, sub.i, msgLen.i = 0
+  While PeekA(?ScrollText + msgLen) <> 0 : msgLen = msgLen + 1 : Wend
+  start = (frame * 2) / 16
+  sub = (frame * 2) % 16
+  For i = 0 To 21
+    c = PeekA(?ScrollText + ((start + i) % msgLen))
+    x = (i * 16) - sub
+    y = 196 + ((Sin14((x * 2) + (frame * 5)) * 14) >> 14)
+    RdpFillColor(Hue16((x >> 1) + frame))
+    DrawGlyph(c, x, y, 2)
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SYNTHESISER: four voices into 16-bit stereo, 22050 a second
+; ----------------------------------------------------------------------
+Procedure.i NoteStep(n.i)
+  If n <= 0 Or n > 95 : ProcedureReturn 0 : EndIf
+  ProcedureReturn PeekL(?NoteInc + (n * 4)) & $FFFFFFFF
+EndProcedure
+
+; the next sixteenth: whatever each track starts on this row
+Procedure NextRow()
+  Protected n.i
+  n = PeekA(?SongLead + row)
+  If n > 0 : leadInc = NoteStep(n) : leadEnv = 32767 : EndIf
+  n = PeekA(?SongArp + row)
+  If n > 0 : arpInc = NoteStep(n) : arpEnv = 32767 : EndIf
+  n = PeekA(?SongBass + row)
+  If n > 0 : bassInc = NoteStep(n) : bassEnv = 32767 : EndIf
+  n = PeekA(?SongDrum + row)
+  Select n
+    Case 1 : kickInc = NoteStep(40) : kickEnv = 32767 : kickPhase = 0
+    Case 2 : noiseEnv = 32767 : noiseDecay = 6
+    Case 3 : noiseEnv = 12000 : noiseDecay = 4
+  EndSelect
+  row = row + 1
+  If row >= #SONG_ROWS : row = 0 : EndIf
+EndProcedure
+
+Procedure FillAudio(buf.i)
+  Protected i.i, l.i, r.i, v.i, mix.i
+  For i = 0 To #AUDIO_SAMPLES - 1
+    If rowSample <= 0
+      NextRow()
+      rowSample = #ROW_SAMPLES
+    EndIf
+    rowSample = rowSample - 1
+    ; the lead: a pulse, a quarter on
+    leadPhase = (leadPhase + leadInc) & $FFFFFFFF
+    If leadPhase < $40000000 : v = leadEnv : Else : v = -leadEnv : EndIf
+    l = (v * 3) >> 4
+    r = (v * 2) >> 4
+    leadEnv = leadEnv - (leadEnv >> 12)
+    ; the arpeggio: a saw, a little to the right
+    arpPhase = (arpPhase + arpInc) & $FFFFFFFF
+    v = (((arpPhase >> 16) - 32768) * arpEnv) >> 15
+    l = l + ((v * 1) >> 4)
+    r = r + ((v * 3) >> 4)
+    arpEnv = arpEnv - (arpEnv >> 9)
+    ; the bass: a square, centred
+    bassPhase = (bassPhase + bassInc) & $FFFFFFFF
+    If bassPhase < $80000000 : v = bassEnv : Else : v = -bassEnv : EndIf
+    l = l + ((v * 4) >> 4)
+    r = r + ((v * 4) >> 4)
+    bassEnv = bassEnv - (bassEnv >> 11)
+    ; the kick: a sine falling in pitch
+    If kickEnv > 64
+      kickPhase = (kickPhase + kickInc) & $FFFFFFFF
+      v = (Sin14(kickPhase >> 24) * kickEnv) >> 14
+      l = l + ((v * 3) >> 3)
+      r = r + ((v * 3) >> 3)
+      kickInc = kickInc - (kickInc >> 9)
+      kickEnv = kickEnv - (kickEnv >> 10)
+    EndIf
+    ; the snare and the hats: noise
+    If noiseEnv > 64
+      lfsr = ((lfsr >> 1) ! ((0 - (lfsr & 1)) & $B400)) & $FFFF
+      v = (((lfsr & 255) - 128) * noiseEnv) >> 7
+      l = l + (v >> 3)
+      r = r + (v >> 3)
+      noiseEnv = noiseEnv - (noiseEnv >> noiseDecay) - 1
+    EndIf
+    l = Max(-32767, Min(32767, l))
+    r = Max(-32767, Min(32767, r))
+    PokeW(buf + (i * 4), l)
+    PokeW(buf + (i * 4) + 2, r)
+  Next
+EndProcedure
+
+; keep the AI fed: a new buffer whenever it has room for one
+Procedure PumpAudio()
+  Protected buf.i
+  While N64AudioFull() = 0
+    buf = #N64_AUDIO + (audioBuf * #AUDIO_BYTES)
+    FillAudio(buf)
+    N64AudioQueue(buf, #AUDIO_BYTES)
+    audioBuf = (audioBuf + 1) % #AUDIO_BUFS
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+Procedure Main()
+  N64VideoInit()
+  N64AudioInit(#DEMO_RATE)
+  InitStars()
+  Repeat
+    PumpAudio()
+    RdpBegin()
+    RdpTarget(N64FbDraw)
+    RdpFillMode()
+    DrawBackground()
+    DrawStars()
+    DrawObjects()
+    DrawTitle()
+    DrawScroller()
+    RdpRun()
+    PumpAudio()
+    N64WaitVBlank()
+    N64Flip()
+    frame = frame + 1
+  ForEver
+EndProcedure
+
+Main()
+
+DataSection
+TitleText:
+  Data.a 80, 85, 82, 69, 77, 69, 84, 65, 76    ; PUREMETAL
+EndDataSection

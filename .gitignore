@@ -1,0 +1,6 @@
+# built by PureMetal Forge
+*.bin
+*.sym
+*.asm
+*.txt
+PureMetalDemo/*.z64
