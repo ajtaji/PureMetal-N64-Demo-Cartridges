@@ -10,10 +10,17 @@
 # 3. the cartridge: PureMetal Forge, headless, -> WardensMarch.bin and WardensMarch.z64
 param(
   [string]$WardensKey = "C:\Embedded Compiler\WardensKey",
-  [string]$Forge = (Join-Path $PSScriptRoot "..\..\..\..\PureMetalForge.exe"),
+  [string]$Forge = "",
   [string]$HostCompiler = "C:\Users\rajta\AppData\Local\Programs\PureBasic\Compilers\pbcompilerc.exe"
 )
 $ErrorActionPreference = "Stop"
+# PureMetal Forge: as given, or beside the compiler's own examples, or on the PATH
+if ($Forge -eq "") {
+  $beside = Join-Path $PSScriptRoot "..\..\..\..\PureMetalForge.exe"
+  if (Test-Path $beside) { $Forge = $beside }
+  elseif (Get-Command PureMetalForge.exe -ErrorAction SilentlyContinue) { $Forge = (Get-Command PureMetalForge.exe).Source }
+  else { throw "PureMetalForge.exe was not found: put it on the PATH or pass -Forge <path>" }
+}
 Set-Location $PSScriptRoot
 # the build number: version.n64's #DEMO_BUILD, one more on every build (the version is on screen)
 $vf = Join-Path $PSScriptRoot "version.n64"
