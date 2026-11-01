@@ -30,12 +30,16 @@ checksum and their own IPL3. Load one in an N64 emulator the way you load any
 `.z64`.
 
 - **Tested on:** the PureMetal N64 emulator (the one these demos were developed
-  on), 60 frames a second, sound at 48 kHz.
-- **Not yet tested on:** other emulators and real hardware (a flash cartridge
-  such as an EverDrive or SummerCart64). An emulator must boot the cartridge's
-  own IPL3 - low-level boot - rather than replace it; the demos use only the
-  documented hardware (VI, AI, PI, the RSP and the RDP). Reports are welcome in
-  [Issues](../../issues).
+  on), 60 frames a second, sound at 48 kHz; and **ares v148** (paraLLEl-RDP),
+  which boots them like a console would: through their own boot code.
+- **Not yet tested on:** real hardware (a flash cartridge such as an EverDrive
+  or SummerCart64). The boot block is signed for the 6102 CIC and initialises
+  RDRAM, the caches and the PIF itself, as a console needs, so it should run;
+  reports are welcome in [Issues](../../issues).
+- **The boot code is the compiler's own**, in two stages, no Nintendo code: a
+  signed first stage that never changes and a second stage in the cartridge.
+- **The version is on screen**, bottom right (`V1.1.n`, `n` the build number,
+  raised by `build.ps1` on every build).
 
 ## Building them yourself
 
@@ -64,6 +68,8 @@ March*), and **Python 3** only if you change a demo's tables.
     PureMetalForge.exe --compile demo.n64 -o demo.bin
 
 writes `demo.bin` and `demo.z64` the same way, without opening the IDE.
+`PureMetalDemouild.ps1` does that and raises the build number in
+`version.n64` first (the version the demo shows bottom right).
 
 ### Changing the tables
 

@@ -16,6 +16,7 @@
 ; ======================================================================
 XIncludeFile "Mips/Lib/n64.n64"
 XIncludeFile "demo_assets.n64"
+XIncludeFile "version.n64"
 
 #STARS = 48
 #AUDIO_SAMPLES = 368                    ; a buffer: 368 stereo samples, 1472 bytes
@@ -222,6 +223,24 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  the title and the scroller
 ; ----------------------------------------------------------------------
+; the version (version.n64), bottom right, in the title's colours
+Procedure DrawVersionNum(n.i, x.i, y.i)
+  Protected d.i = 1
+  While d * 10 <= n : d = d * 10 : Wend
+  While d > 0
+    DrawGlyph(48 + ((n / d) % 10), x, y, 1) : x = x + 8 : d = d / 10
+  Wend
+  ProcedureReturn x
+EndProcedure
+Procedure DrawVersion()
+  Protected x.i = 262
+  RdpFillColor(N64Rgb16(200, 200, 200))
+  DrawGlyph(86, x, 230, 1) : x = x + 8
+  x = DrawVersionNum(#DEMO_MAJOR, x, 230) : DrawGlyph(46, x, 230, 1) : x = x + 8
+  x = DrawVersionNum(#DEMO_MINOR, x, 230) : DrawGlyph(46, x, 230, 1) : x = x + 8
+  DrawVersionNum(#DEMO_BUILD, x, 230)
+EndProcedure
+
 Procedure DrawTitle()
   Protected i.i, c.i, x.i
   ; "PUREMETAL", 3x, each letter its own colour, the colours walking
@@ -350,6 +369,7 @@ Procedure Main()
     DrawObjects()
     DrawTitle()
     DrawScroller()
+    DrawVersion()
     RdpRun()
     PumpAudio()
     N64WaitVBlank()
