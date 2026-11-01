@@ -106,3 +106,7 @@ engine, its RSP synthesiser and the torus microcode - will be added here.
 - **The RSP** (in *The Warden's March*) is shared between two microcode
   programs - the music synthesiser and the torus - each put back on the RSP
   when it is its turn, with the music's state saved in between.
+
+## License
+
+MIT - see [LICENSE](LICENSE).
