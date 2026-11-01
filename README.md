@@ -1,8 +1,9 @@
 # PureMetal N64 Demo Cartridges
 
 **Nintendo 64 homebrew demos written in PureMetal** - a BASIC-style language -
-and compiled by **PureMetal Forge**, an IDE and compiler that builds straight to
-N64 machine code with its own boot code (IPL3): no SDK, no libultra, no C.
+and compiled by **[PureMetal Forge](https://puremetalforge.ajtaji.com)**, an IDE
+and compiler that builds straight to N64 machine code with its own boot code
+(IPL3): no SDK, no libultra, no C.
 
 ![The Warden's March](screenshots/wardens-march-2.png)
 
@@ -38,9 +39,10 @@ checksum and their own IPL3. Load one in an N64 emulator the way you load any
 
 ## Building them yourself
 
-You need **PureMetal Forge** with its Nintendo 64 back end (the VR4300, and the
-RSP for *The Warden's March*), and **Python 3** only if you change a demo's
-tables.
+You need **PureMetal Forge** - from the **Microsoft Store** (search for
+"PureMetal Forge") or from **[puremetalforge.ajtaji.com](https://puremetalforge.ajtaji.com)** -
+with its Nintendo 64 back end (the VR4300, and the RSP for *The Warden's
+March*), and **Python 3** only if you change a demo's tables.
 
 ### In the IDE
 
