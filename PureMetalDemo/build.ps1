@@ -10,12 +10,7 @@ if ($Forge -eq "") {
   else { throw "PureMetalForge.exe was not found: put it on the PATH or pass -Forge <path>" }
 }
 Set-Location $PSScriptRoot
-# the build number: version.n64's #DEMO_BUILD, one more on every build (the version is on screen)
-$vf = Join-Path $PSScriptRoot "version.n64"
-$v = Get-Content $vf
-$v = $v | ForEach-Object { if ($_ -match '^#DEMO_BUILD = (\d+)') { "#DEMO_BUILD = " + ([int]$Matches[1] + 1) } else { $_ } }
-Set-Content -Path $vf -Value $v -Encoding ASCII
-"build " + (($v | Select-String '^#DEMO_MAJOR = (\d+)').Matches[0].Groups[1].Value) + "." + (($v | Select-String '^#DEMO_MINOR = (\d+)').Matches[0].Groups[1].Value) + "." + (($v | Select-String '^#DEMO_BUILD = (\d+)').Matches[0].Groups[1].Value)
+# the build number (version.n64's #DEMO_BUILD, on screen) is the compiler's: one more on every build, in the IDE too
 # (Forge is a windowed program: PowerShell does not wait for it or see its exit code
 # unless started this way)
 $fp = Start-Process -FilePath $Forge -ArgumentList '--compile','demo.n64','-o','PureMetalDemo.bin' -NoNewWindow -Wait -PassThru
