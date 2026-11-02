@@ -1,0 +1,105 @@
+; ======================================================================
+;  fuzz.rsp - the RSP side of the reserved-opcode fuzz cartridge
+; ======================================================================
+;  Assembled by PureMetal Forge's RSP assembler (.rspfile in rsp_fuzz.n64).
+;
+;  ONE RUN = one vector instruction under test, on up to 8 cases. The CPU
+;  writes the instruction into the two slots below (the words $34001111 and
+;  $34002222 - "ori zero, zero, ..." - which it finds in IMEM and replaces
+;  before every run) and the cases into DMEM; the RSP runs them and halts.
+;
+;  A CASE (128 bytes in CIN): vs, vt, vd's value before, then A B C D - the
+;  accumulator is set by "vmudh A, B" then "vmadn C, D" - then VCO, VCC, VCE
+;  (halves). Its RECORD (128 bytes in COUT): the accumulator after the setup
+;  (high, middle, low - read by vsar), vd after the instruction, the
+;  accumulator after it (high, middle, low), then VCO, VCC, VCE (halves).
+;
+;  TWO VARIANTS (TASK+4): 0 - the instruction alone, three nops either side
+;  of it; 1 - the instruction straight after the accumulator's setup, so a
+;  multiply still in the pipe meets it (n64-systemtest's V30 note: with
+;  fewer than three nops a previous multiply still writes the accumulator).
+;  Variant 1 sets the accumulator up a second time (the same two
+;  multiplies) after the first reading, so its "before" is known too.
+;
+;  The registers: vs $v8, vt $v9, vd $v10; A-D $v1-$v4; the setup's own
+;  result $v5; the readings $v11-$v16; $v0 zero.
+; ======================================================================
+.data
+task:   .space 16          ; +0 the cases this run, +4 the variant
+cin:    .space 1024        ; the cases (8 at most)
+cout:   .space 1024        ; their records
+.text
+start:
+    lw s0, task+0(zero)
+    lw s1, task+4(zero)
+    addiu t0, zero, cin
+    addiu t1, zero, cout
+    vxor $v0, $v0, $v0
+next:
+    beq s0, zero, done
+    nop
+    lqv $v8[0], 0(t0)
+    lqv $v9[0], 16(t0)
+    lqv $v10[0], 32(t0)
+    lqv $v1[0], 48(t0)
+    lqv $v2[0], 64(t0)
+    lqv $v3[0], 80(t0)
+    lqv $v4[0], 96(t0)
+    lhu t2, 112(t0)
+    ctc2 t2, $0
+    lhu t2, 114(t0)
+    ctc2 t2, $1
+    lhu t2, 116(t0)
+    ctc2 t2, $2
+; the accumulator: A x B << 16, then + C (unsigned) x D
+    vmudh $v5, $v1, $v2
+    vmadn $v5, $v3, $v4
+    nop
+    nop
+    nop
+    vsar $v11, $v0, 8
+    vsar $v12, $v0, 9
+    vsar $v13, $v0, 10
+    nop
+    nop
+    nop
+    bne s1, zero, varb
+    nop
+; variant 0: the instruction alone
+    .word 0x34001111
+    nop
+    nop
+    nop
+    j post
+    nop
+; variant 1: the instruction straight after the setup
+varb:
+    vmudh $v5, $v1, $v2
+    vmadn $v5, $v3, $v4
+    .word 0x34002222
+    nop
+    nop
+    nop
+post:
+    vsar $v14, $v0, 8
+    vsar $v15, $v0, 9
+    vsar $v16, $v0, 10
+    cfc2 t3, $0
+    cfc2 t8, $1
+    cfc2 t9, $2
+    sqv $v11[0], 0(t1)
+    sqv $v12[0], 16(t1)
+    sqv $v13[0], 32(t1)
+    sqv $v10[0], 48(t1)
+    sqv $v14[0], 64(t1)
+    sqv $v15[0], 80(t1)
+    sqv $v16[0], 96(t1)
+    sh t3, 112(t1)
+    sh t8, 114(t1)
+    sh t9, 116(t1)
+    addiu t0, t0, 128
+    addiu t1, t1, 128
+    j next
+    addiu s0, s0, -1
+done:
+    break

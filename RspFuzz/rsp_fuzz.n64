@@ -1,0 +1,324 @@
+; ======================================================================
+;  rsp_fuzz.n64 - the RSP's reserved vector opcodes, recorded on a console
+; ======================================================================
+;  Built by PureMetal Forge for the VR4300 (the Nintendo 64 board): open it in
+;  the IDE and Compile, or
+;      PureMetalForge.exe --compile rsp_fuzz.n64 -o RspFuzz.bin
+;  writes RspFuzz.z64.
+;
+;  WHAT IT IS FOR. Twenty-one of the RSP's 64 vector function codes are not
+;  documented (VSUT, VADDB, VSUBB, VACCB, VSUCB, VSAD, VSAC, VSUM, V30, V31,
+;  V46, V47, VNOP, VEXTT, VEXTQ, VEXTN, V59, VINST, VINSQ, VINSN, VNULL), and
+;  emulators guess what they do. This cartridge runs each of them - and two
+;  known ones as a control (VADD, VMULF) - on a console, in all 16 element
+;  modes, in two pipeline variants (fuzz.rsp), on 4 cases each - one of edge
+;  values, three random - and records what the RSP leaves: vd, the whole
+;  accumulator before and after, VCO VCC VCE. 23 x 16 x 2 x 4 = 2944 cases.
+;
+;  THE RECORD goes out three ways:
+;   - the ISViewer (a SummerCart64 or 64drive with its IS-Viewer 64 emulation
+;     on, or an emulator): one line a case, "C oo e v c <in> <out>", the 128
+;     bytes the RSP was given and the 128 it gave back, in hex - the full data;
+;   - the screen: each opcode's CRC-32 over its records, and the total -
+;     enough to tell at a glance whether an emulator agrees with the console;
+;   - nothing is written to the cartridge's save memory.
+;  Everything the cartridge does is a function of its fixed seed: run twice,
+;  on any console, it gives the same log. Compare a console's log with an
+;  emulator's with rspfuzz_diff.py (in the RspFuzz folder of
+;  github.com/ajtaji/PureMetal-N64-Demo-Cartridges).
+; ======================================================================
+XIncludeFile "Mips/Lib/n64.n64"
+XIncludeFile "fuzz_font.n64"
+XIncludeFile "version.n64"
+
+ASM
+  .rspfile "fuzz.rsp"
+EndASM
+
+#OPS = 23
+#CASES = 4                              ; a run: one instruction, these many cases
+#RUNS = #OPS * 16 * 2
+#DMEM_TASK = #N64_DMEM
+#DMEM_IN = #N64_DMEM + 16
+#DMEM_OUT = #N64_DMEM + 16 + 1024
+#IMEM = $A4001000
+
+Global rnd.i = $2545F491
+Global slotA.i, slotB.i, runN.i, caseN.i, allCrc.i = $FFFFFFFF, fail.i
+Global Dim opCrc.i(#OPS)
+Global Dim caseIn.i(32)
+Global Dim runIn.i(#CASES * 32)
+Global isvLen.i
+Global Dim isvLine.b(700)
+
+Procedure.i Rnd32()                     ; xorshift32
+  rnd = rnd ! ((rnd << 13) & $FFFFFFFF)
+  rnd = rnd ! (rnd >> 17)
+  rnd = rnd ! ((rnd << 5) & $FFFFFFFF)
+  rnd = rnd & $FFFFFFFF
+  ProcedureReturn rnd
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CRC-32 (the zip one), a word at a time, high byte first
+; ----------------------------------------------------------------------
+Procedure.i Crc32Word(crc.i, w.i)
+  Protected k.i, b.i
+  For k = 3 To 0 Step -1
+    crc = crc ! ((w >> (k * 8)) & 255)
+    For b = 0 To 7
+      If crc & 1 : crc = (crc >> 1) ! $EDB88320 : Else : crc = crc >> 1 : EndIf
+    Next
+  Next
+  ProcedureReturn crc & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE ISVIEWER: a line at a time ($13FF0020 the text, $13FF0014 its length)
+; ----------------------------------------------------------------------
+Procedure IsvPut(c.i)
+  If isvLen < 690 : isvLine(isvLen) = c : isvLen = isvLen + 1 : EndIf
+EndProcedure
+Procedure IsvHex(v.i, digits.i)
+  Protected k.i, d.i
+  For k = digits - 1 To 0 Step -1
+    d = (v >> (k * 4)) & 15
+    If d > 9 : IsvPut(d + 55) : Else : IsvPut(d + 48) : EndIf
+  Next
+EndProcedure
+Procedure IsvFlush()
+  Protected k.i, w.i, n.i
+  IsvPut(10)
+  n = isvLen                            ; (the length sent is the text's; the last word's spare bytes are zeros)
+  While isvLen & 3 : isvLine(isvLen) = 0 : isvLen = isvLen + 1 : Wend
+  For k = 0 To isvLen - 1 Step 4
+    w = ((isvLine(k) & 255) << 24) | ((isvLine(k + 1) & 255) << 16) | ((isvLine(k + 2) & 255) << 8) | (isvLine(k + 3) & 255)
+    PokeL($B3FF0020 + k, w)
+  Next
+  PokeL($B3FF0014, n)
+  isvLen = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CASES
+; ----------------------------------------------------------------------
+; Case c of a run: 32 words (vs, vt, vd before, A, B, C, D, then VCO VCC VCE).
+; Case 0 is edge values in vs and vt; the rest are random.
+Procedure MakeCase(c.i)
+  Protected k.i
+  For k = 0 To 27 : caseIn(k) = Rnd32() : Next
+  If c = 0
+    For k = 0 To 3
+      caseIn(k) = ((PeekW(?EdgeS + (k * 4)) & $FFFF) << 16) | (PeekW(?EdgeS + (k * 4) + 2) & $FFFF)
+      caseIn(4 + k) = ((PeekW(?EdgeT + (k * 4)) & $FFFF) << 16) | (PeekW(?EdgeT + (k * 4) + 2) & $FFFF)
+    Next
+  EndIf
+  caseIn(28) = Rnd32()                  ; VCO, VCC
+  caseIn(29) = (Rnd32() & $FF) << 16    ; VCE
+  caseIn(30) = 0 : caseIn(31) = 0
+  For k = 0 To 31 : PokeL(#DMEM_IN + (c * 128) + (k * 4), caseIn(k)) : Next
+EndProcedure
+
+; The RSP's instruction under test, "op $v10, $v8, $v9[e]".
+Procedure.i OpWord(op.i, e.i)
+  ProcedureReturn $4A000000 | ((e & 15) << 21) | (9 << 16) | (8 << 11) | (10 << 6) | (PeekA(?OpTable + (op * 8)) & 63)
+EndProcedure
+
+; One run: the instruction into both slots, the cases into DMEM, the RSP run,
+; each record read back, checked into the CRCs and printed.
+Procedure Run(op.i, e.i, v.i)
+  Protected c.i, k.i, w.i
+  N64RspHalt()
+  w = OpWord(op, e)
+  PokeL(#IMEM + slotA, w) : PokeL(#IMEM + slotB, w)
+  PokeL(#DMEM_TASK, #CASES) : PokeL(#DMEM_TASK + 4, v)
+  For c = 0 To #CASES - 1
+    MakeCase(c)
+    For k = 0 To 31 : runIn(c * 32 + k) = caseIn(k) : Next
+  Next
+  N64RspRun()
+  While N64RspDone() = 0 : Wend
+  For c = 0 To #CASES - 1
+    IsvPut(67) : IsvPut(32) : IsvHex(op, 2) : IsvPut(32) : IsvHex(e, 1) : IsvPut(32) : IsvHex(v, 1) : IsvPut(32) : IsvHex(c, 1) : IsvPut(32)
+    For k = 0 To 31 : IsvHex(runIn(c * 32 + k), 8) : Next
+    IsvPut(32)
+    For k = 0 To 31
+      w = PeekL(#DMEM_OUT + (c * 128) + (k * 4)) & $FFFFFFFF
+      IsvHex(w, 8)
+      opCrc(op) = Crc32Word(opCrc(op), w)
+      allCrc = Crc32Word(allCrc, w)
+    Next
+    IsvFlush()
+    caseN = caseN + 1
+  Next
+  runN = runN + 1
+EndProcedure
+
+; The two slots' places in IMEM (the words fuzz.rsp leaves for the CPU).
+Procedure FindSlots()
+  Protected k.i, w.i
+  slotA = -1 : slotB = -1
+  For k = 0 To 4092 Step 4
+    w = PeekL(#IMEM + k) & $FFFFFFFF
+    If w = $34001111 : slotA = k : EndIf
+    If w = $34002222 : slotB = k : EndIf
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SCREEN
+; ----------------------------------------------------------------------
+Procedure DrawGlyph(ch.i, x.i, y.i)
+  Protected r.i, bits.i, col.i, g.i, run.i
+  If ch < 32 Or ch > 95 : ProcedureReturn : EndIf
+  g = ?Font + ((ch - 32) * 8)
+  For r = 0 To 6
+    bits = PeekA(g + r)
+    col = 0
+    While bits <> 0
+      If bits & $80
+        run = 0
+        While bits & $80
+          run = run + 1 : bits = (bits << 1) & 255
+        Wend
+        RdpFillRect(x + col, y + r, x + col + run - 1, y + r)
+        col = col + run
+      Else
+        bits = (bits << 1) & 255 : col = col + 1
+      EndIf
+    Wend
+  Next
+EndProcedure
+
+Procedure.i DrawText(t.i, n.i, x.i, y.i)       ; n characters from address t
+  Protected k.i
+  For k = 0 To n - 1 : DrawGlyph(PeekA(t + k), x, y) : x = x + 6 : Next
+  ProcedureReturn x
+EndProcedure
+
+Procedure.i DrawHex(v.i, digits.i, x.i, y.i)
+  Protected k.i, d.i
+  For k = digits - 1 To 0 Step -1
+    d = (v >> (k * 4)) & 15
+    If d > 9 : DrawGlyph(d + 55, x, y) : Else : DrawGlyph(d + 48, x, y) : EndIf
+    x = x + 6
+  Next
+  ProcedureReturn x
+EndProcedure
+
+Procedure.i DrawNum(n.i, x.i, y.i)
+  Protected d.i = 1
+  While d * 10 <= n : d = d * 10 : Wend
+  While d > 0
+    DrawGlyph(48 + ((n / d) % 10), x, y)
+    x = x + 6 : d = d / 10
+  Wend
+  ProcedureReturn x
+EndProcedure
+
+Procedure DrawScreen()
+  Protected op.i, x.i, y.i
+  RdpFillColor(N64Rgb16(8, 10, 24)) : RdpFillRect(0, 0, #N64_W - 1, #N64_H - 1)
+  RdpFillColor(N64Rgb16(255, 210, 80))
+  DrawText(?TitleText, 30, 16, 8)
+  RdpFillColor(N64Rgb16(200, 200, 220))
+  x = DrawText(?CasesText, 6, 16, 20) : x = DrawNum(caseN, x, 20) : x = DrawText(?OfText, 4, x, 20) : DrawNum(#RUNS * #CASES, x, 20)
+  If fail
+    RdpFillColor(N64Rgb16(255, 80, 80)) : DrawText(?FailText, 32, 16, 120)
+    ProcedureReturn
+  EndIf
+  For op = 0 To #OPS - 1
+    y = 34 + (op * 8)
+    If op < 2 : RdpFillColor(N64Rgb16(120, 200, 255)) : Else : RdpFillColor(N64Rgb16(220, 220, 220)) : EndIf
+    DrawText(?OpTable + (op * 8) + 1, 6, 16, y)
+    DrawHex(PeekA(?OpTable + (op * 8)) & 63, 2, 64, y)
+    If runN >= (op + 1) * 32
+      RdpFillColor(N64Rgb16(120, 255, 140)) : DrawHex(opCrc(op) ! $FFFFFFFF, 8, 88, y)
+    EndIf
+  Next
+  If runN >= #RUNS
+    RdpFillColor(N64Rgb16(255, 210, 80))
+    x = DrawText(?AllText, 4, 16, 222) : DrawHex(allCrc ! $FFFFFFFF, 8, x, 222)
+  EndIf
+  RdpFillColor(N64Rgb16(140, 140, 160))
+  DrawGlyph(86, 256, 228) : x = DrawNum(#DEMO_MAJOR, 262, 228) : DrawGlyph(46, x, 228) : x = DrawNum(#DEMO_MINOR, x + 6, 228) : DrawGlyph(46, x, 228) : DrawNum(#DEMO_BUILD, x + 6, 228)
+EndProcedure
+
+; ----------------------------------------------------------------------
+Procedure Main()
+  Protected op.i, k.i, e.i, v.i
+  N64VideoInit()
+  For op = 0 To #OPS - 1 : opCrc(op) = $FFFFFFFF : Next
+  If N64RspLoad(N64CartFile(0)) = 0 : fail = 1 : EndIf
+  If fail = 0
+    FindSlots()
+    If slotA < 0 Or slotB < 0 : fail = 1 : EndIf
+  EndIf
+  op = 0 : e = 0 : v = 0
+  Repeat
+    For k = 0 To 7                      ; eight runs a frame: the screen keeps up
+      If fail = 0 And runN < #RUNS
+        Run(op, e, v)
+        v = v + 1
+        If v = 2 : v = 0 : e = e + 1 : EndIf
+        If e = 16 : e = 0 : op = op + 1 : EndIf
+        If runN = #RUNS
+          IsvPut(69) : IsvPut(78) : IsvPut(68) : IsvPut(32) : IsvHex(allCrc ! $FFFFFFFF, 8) : IsvFlush()
+        EndIf
+      EndIf
+    Next
+    RdpBegin()
+    RdpTarget(N64FbDraw)
+    RdpFillMode()
+    DrawScreen()
+    RdpRun()
+    RdpWait()
+    N64WaitVBlank()
+    N64Flip()
+  ForEver
+EndProcedure
+
+Main()
+
+DataSection
+; the opcodes: the function code, then the name in 6 characters, then a pad
+OpTable:
+  Data.a 16, 86, 65, 68, 68, 32, 32, 0          ; VADD    (control)
+  Data.a 0, 86, 77, 85, 76, 70, 32, 0           ; VMULF   (control)
+  Data.a 18, 86, 83, 85, 84, 32, 32, 0          ; VSUT
+  Data.a 22, 86, 65, 68, 68, 66, 32, 0          ; VADDB
+  Data.a 23, 86, 83, 85, 66, 66, 32, 0          ; VSUBB
+  Data.a 24, 86, 65, 67, 67, 66, 32, 0          ; VACCB
+  Data.a 25, 86, 83, 85, 67, 66, 32, 0          ; VSUCB
+  Data.a 26, 86, 83, 65, 68, 32, 32, 0          ; VSAD
+  Data.a 27, 86, 83, 65, 67, 32, 32, 0          ; VSAC
+  Data.a 28, 86, 83, 85, 77, 32, 32, 0          ; VSUM
+  Data.a 30, 86, 51, 48, 32, 32, 32, 0          ; V30
+  Data.a 31, 86, 51, 49, 32, 32, 32, 0          ; V31
+  Data.a 46, 86, 52, 54, 32, 32, 32, 0          ; V46
+  Data.a 47, 86, 52, 55, 32, 32, 32, 0          ; V47
+  Data.a 55, 86, 78, 79, 80, 32, 32, 0          ; VNOP
+  Data.a 56, 86, 69, 88, 84, 84, 32, 0          ; VEXTT
+  Data.a 57, 86, 69, 88, 84, 81, 32, 0          ; VEXTQ
+  Data.a 58, 86, 69, 88, 84, 78, 32, 0          ; VEXTN
+  Data.a 59, 86, 53, 57, 32, 32, 32, 0          ; V59
+  Data.a 60, 86, 73, 78, 83, 84, 32, 0          ; VINST
+  Data.a 61, 86, 73, 78, 83, 81, 32, 0          ; VINSQ
+  Data.a 62, 86, 73, 78, 83, 78, 32, 0          ; VINSN
+  Data.a 63, 86, 78, 85, 76, 76, 32, 0          ; VNULL
+; case 0's vs and vt: the edges of a signed and an unsigned halfword
+EdgeS:
+  Data.w 0, 1, $7FFF, $8000, $FFFF, $0100, $00FF, $5555
+EdgeT:
+  Data.w $FFFF, $8000, $7FFF, 1, 0, $AAAA, $1234, $8001
+TitleText:
+  Data.a 82, 83, 80, 32, 82, 69, 83, 69, 82, 86, 69, 68, 32, 79, 80, 67, 79, 68, 69, 32, 70, 85, 90, 90, 32, 32, 32, 32, 32, 32   ; RSP RESERVED OPCODE FUZZ
+CasesText:
+  Data.a 67, 65, 83, 69, 83, 32                 ; CASES
+OfText:
+  Data.a 32, 79, 70, 32                         ;  OF
+AllText:
+  Data.a 65, 76, 76, 32                         ; ALL
+FailText:
+  Data.a 84, 72, 69, 32, 82, 83, 80, 32, 80, 82, 79, 71, 82, 65, 77, 32, 68, 73, 68, 32, 78, 79, 84, 32, 76, 79, 65, 68, 32, 32, 32, 32   ; THE RSP PROGRAM DID NOT LOAD
+EndDataSection

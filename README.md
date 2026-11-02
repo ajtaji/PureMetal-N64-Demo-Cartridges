@@ -16,6 +16,7 @@ Ready to play: download them from [`cartridges/`](cartridges) or from the
 |---|---|
 | [`PureMetalDemo.z64`](cartridges/PureMetalDemo.z64) | **PureMetal Demo** - the first PureMetal N64 demo. Copper bars, a three-speed starfield, a flat-shaded cube with an octahedron going round it, a colour-cycling title, a sine scroller, and a four-voice synthesiser (pulse lead, saw arpeggio, square bass, drums) playing an original tune - all on the VR4300 CPU, drawn by the RDP. |
 | [`WardensMarchLive.z64`](cartridges/WardensMarchLive.z64) | **The Warden's March** - 60 frames a second: copper bars, a Gouraud-lit torus, a starfield and a sine scroller over the main theme of *Warden's Key*, played **live** - the game's sequencer and envelopes on the VR4300, every sample (4-operator FM, wavetables, noise, reverb, 48 kHz, up to 32 voices) on the **RSP**'s vector unit, which also turns, lights, sorts and sets up the torus's triangles between pieces of music. A panel names what you are hearing and what is being drawn. |
+| [`RspFuzz.z64`](cartridges/RspFuzz.z64) | **RSP Reserved Opcode Fuzz** - not a demo but a measurement: it runs the RSP's 21 undocumented vector opcodes (and two known ones as a control) in all 16 element modes and two pipeline variants, 2944 cases, and records exactly what the hardware does. **Help wanted from anyone with a console - see [below](#help-wanted-run-the-rsp-fuzz-cartridge-on-a-console).** |
 
 <p>
 <img src="screenshots/puremetal-demo-1.png" width="320" alt="PureMetal Demo">
@@ -41,6 +42,43 @@ checksum and their own IPL3. Load one in an N64 emulator the way you load any
 - **The version is on screen**, bottom right (`V1.1.n`, `n` the build number:
   the compiler raises it on every build, in the IDE as on the command line -
   the `; @build` line in `version.n64`).
+
+## Help wanted: run the RSP fuzz cartridge on a console
+
+<img src="screenshots/rsp-fuzz.png" width="320" alt="RSP Reserved Opcode Fuzz">
+
+The RSP's vector unit has 64 function codes and 21 of them are undocumented
+(VSUT, VADDB, VSUBB, VACCB, VSUCB, VSAD, VSAC, VSUM, V30, V31, V46, V47, VNOP,
+VEXTT, VEXTQ, VEXTN, V59, VINST, VINSQ, VINSN, VNULL). No game uses them, but
+emulators have to do *something*, and the two published hardware captures
+already disagree about one of them (VNULL). `RspFuzz.z64` measures them: each
+opcode on four cases (edge values and random ones) in every element mode, once
+on its own and once straight after a multiply (the pipeline matters), recording
+vd, the whole accumulator before and after, and VCO/VCC/VCE.
+
+**What it needs:** a console and a flash cartridge. It runs for about five
+seconds and then shows each opcode's CRC-32 on screen.
+
+**What to send back** (an [Issue](../../issues) is perfect):
+
+- **A photo of the finished screen.** The CRCs alone tell which emulator is
+  right for each opcode.
+- **Best: the full log.** The cartridge prints every case to the
+  **IS-Viewer 64** debug port (`$13FF0000`). A **SummerCart64** can capture it
+  over USB with its IS-Viewer emulation enabled (see `sc64deployer debug
+  --help`; the IS-Viewer is at ROM offset `0x3FF0000`). The log is 2944 lines
+  of `C <op> <element> <variant> <case> <input> <output>` and `END <crc>`.
+
+**What the emulators say today** (the screen's CRCs; all other opcodes agree):
+
+| | VNULL | ALL |
+|---|---|---|
+| PureMetal N64 emulator (krom's V073 capture: vd = vs, low accumulator 0) | `8F75B7D1` | `07F12E67` |
+| ares v148 (and n64-systemtest's harness: nothing written) | `632AF2E6` | `EBAE6B50` |
+
+`RspFuzz/rspfuzz_diff.py <console log> <emulator log> --show 5` compares two
+logs case by case and prints the lanes that differ. The cartridge is fully
+deterministic (a fixed seed), so the same build gives the same log everywhere.
 
 ## Building them yourself
 
