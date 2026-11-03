@@ -86,7 +86,7 @@ CAPTIONS = [
     ("TORUS", "128 QUADS", "GOURAUD-LIT"),
     ("STARFIELD", "56 STARS", "IN DEPTH"),
     ("COPPER BARS", "SHADED", "RECTANGLES"),
-    ("SCROLLER", "ON A SINE", "5X7 FONT"),
+    ("SCROLLER", "ON A SINE", "IN LATO"),
     ("THE FLOOR", "14 BANDS", "RUSHING IN"),
     ("ALL OF IT", "DRAWN BY", "THE RDP"),
 ]
@@ -103,6 +103,9 @@ HUD = {
     "HudRev3": "4 ALL-PASS",
     "HudSee": "SEEING:",
     "HudMade": "WRITTEN AND COMPILED IN PUREMETAL",
+    "HudVee": "V",
+    "HudDot": ".",
+    "HudDigits": "0123456789",
 }
 
 

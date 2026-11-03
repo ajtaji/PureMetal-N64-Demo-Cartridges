@@ -3,7 +3,9 @@
 **Nintendo 64 homebrew demos written in PureMetal** - a BASIC-style language -
 and compiled by **[PureMetal Forge](https://puremetalforge.ajtaji.com)**, an IDE
 and compiler that builds straight to N64 machine code with its own boot code
-(IPL3): no SDK, no libultra, no C.
+(IPL3): no SDK, no libultra, no C. Their text is **Lato**, a TrueType font
+rasterized on the console by the compiler's own TrueType library and drawn by
+the RDP.
 
 ![The Warden's March](screenshots/wardens-march-2.png)
 
@@ -16,12 +18,14 @@ Ready to play: download them from [`cartridges/`](cartridges) or from the
 |---|---|
 | [`PureMetalDemo.z64`](cartridges/PureMetalDemo.z64) | **PureMetal Demo** - the first PureMetal N64 demo. Copper bars, a three-speed starfield, a flat-shaded cube with an octahedron going round it, a colour-cycling title, a sine scroller, and a four-voice synthesiser (pulse lead, saw arpeggio, square bass, drums) playing an original tune - all on the VR4300 CPU, drawn by the RDP. |
 | [`WardensMarchLive.z64`](cartridges/WardensMarchLive.z64) | **The Warden's March** - 60 frames a second: copper bars, a Gouraud-lit torus, a starfield and a sine scroller over the main theme of *Warden's Key*, played **live** - the game's sequencer and envelopes on the VR4300, every sample (4-operator FM, wavetables, noise, reverb, 48 kHz, up to 32 voices) on the **RSP**'s vector unit, which also turns, lights, sorts and sets up the torus's triangles between pieces of music. A panel names what you are hearing and what is being drawn. |
+| [`TrueTypeDemo.z64`](cartridges/TrueTypeDemo.z64) | **TrueType on the Nintendo 64** - Lato Regular from the cartridge, each glyph rasterized on the VR4300 the first time it is drawn (4 x 4 samples a pixel), then drawn by the RDP as a texture blended over the picture. The smallest example of text in a PureMetal cartridge. |
 | [`RspFuzz.z64`](cartridges/RspFuzz.z64) | **RSP Reserved Opcode Fuzz** - not a demo but a measurement: it runs the RSP's 21 undocumented vector opcodes (and two known ones as a control) in all 16 element modes and two pipeline variants, 2944 cases, and records exactly what the hardware does. **Help wanted from anyone with a console - see [below](#help-wanted-run-the-rsp-fuzz-cartridge-on-a-console).** |
 
 <p>
 <img src="screenshots/puremetal-demo-1.png" width="320" alt="PureMetal Demo">
 <img src="screenshots/puremetal-demo-2.png" width="320" alt="PureMetal Demo">
 <img src="screenshots/wardens-march-1.png" width="320" alt="The Warden's March">
+<img src="screenshots/truetype-demo.png" width="320" alt="TrueType on the Nintendo 64">
 </p>
 
 ### Playing them
@@ -33,10 +37,13 @@ checksum and their own IPL3. Load one in an N64 emulator the way you load any
 - **Tested on:** the PureMetal N64 emulator (the one these demos were developed
   on), 60 frames a second, sound at 48 kHz; and **ares v148** (paraLLEl-RDP),
   which boots them like a console would: through their own boot code.
-- **Not yet tested on:** real hardware (a flash cartridge such as an EverDrive
-  or SummerCart64). The boot block is signed for the 6102 CIC and initialises
-  RDRAM, the caches and the PIF itself, as a console needs, so it should run;
-  reports are welcome in [Issues](../../issues).
+- **On a console:** `RspFuzz.z64` has run on an NTSC console from a flash
+  cartridge - but only after a soft reset, not from power-on. The boot code's
+  second stage has since been rewritten to do what a cold console needs, the
+  way libdragon's open-source IPL3 does it (the RI's current set by hand, the
+  CPU's COP0 registers cleared, RDRAM cleared after its chips are set up). The
+  cartridges here are built with it; a cold boot on a console is not yet
+  confirmed. Reports are welcome in [Issues](../../issues).
 - **The boot code is the compiler's own**, in two stages, no Nintendo code: a
   signed first stage that never changes and a second stage in the cartridge.
 - **The version is on screen**, bottom right (`V1.1.n`, `n` the build number:
@@ -69,12 +76,13 @@ seconds and then shows each opcode's CRC-32 on screen.
   --help`; the IS-Viewer is at ROM offset `0x3FF0000`). The log is 2944 lines
   of `C <op> <element> <variant> <case> <input> <output>` and `END <crc>`.
 
-**What the emulators say today** (the screen's CRCs; all other opcodes agree):
-
-| | VNULL | ALL |
-|---|---|---|
-| PureMetal N64 emulator (krom's V073 capture: vd = vs, low accumulator 0) | `8F75B7D1` | `07F12E67` |
-| ares v148 (and n64-systemtest's harness: nothing written) | `632AF2E6` | `EBAE6B50` |
+**What is known so far:** a run on an NTSC console gave the same CRCs as
+ares v148 for all 23 opcodes (VNULL `632AF2E6`, ALL `EBAE6B50`): VNULL writes
+nothing. The PureMetal N64 emulator modelled VNULL on krom's V073 capture
+(vd = vs, the low accumulator 0) and gave `8F75B7D1`; it now writes nothing
+too and gives `EBAE6B50`. So the emulators agree with the console - but a CRC
+only says *that* they agree. **The full log is still wanted**: it is the only
+record of *what* each undocumented opcode does.
 
 `RspFuzz/rspfuzz_diff.py <console log> <emulator log> --show 5` compares two
 logs case by case and prints the lanes that differ. The cartridge is fully
@@ -107,14 +115,18 @@ March*), and **Python 3** only if you change a demo's tables.
     PureMetalForge.exe --compile demo.n64 -o demo.bin
 
 writes `demo.bin` and `demo.z64` the same way, without opening the IDE.
-`PureMetalDemouild.ps1` does that and raises the build number in
+`PureMetalDemo\build.ps1` does that and raises the build number in
 `version.n64` first (the version the demo shows bottom right).
+
+You need a PureMetal Forge with **`Mips/Lib/n64_ttf.n64`** (the TrueType
+library, from 2 November 2026): an older Forge stops at the demo's
+`XIncludeFile "Mips/Lib/n64_ttf.n64"`.
 
 ### Changing the tables
 
-Everything the demo reads - the sine table, the 5x7 font, the note steps, the
-tune and the scroller's message - is in `demo_assets.n64`, written by
-`make_demo_assets.py`. Edit the Python (the song is a list of rows, the
+Everything the demo reads - the sine table, the note steps, the tune and the
+scroller's message - is in `demo_assets.n64`, written by
+`make_demo_assets.py`. (Its 8x8 font is no longer drawn: the text is Lato.) Edit the Python (the song is a list of rows, the
 message a string), then
 
     python make_demo_assets.py
@@ -128,6 +140,7 @@ and compile again.
 | `demo.n64` | the demo, in PureMetal |
 | `demo_assets.n64` | its tables, generated - do not edit by hand |
 | `make_demo_assets.py` | the generator of `demo_assets.n64` |
+| `Lato-Regular.ttf`, `OFL.txt` | the text's font, put on the cartridge whole (`.cartfile`), and its licence |
 
 The program starts with `XIncludeFile "Mips/Lib/n64.n64"`: the Nintendo 64
 library that comes with PureMetal Forge (video and the RDP, audio, the
@@ -148,6 +161,10 @@ byte-for-byte the same file.
 | `wardens_assets.n64` | tables, generated by `make_assets.py` |
 | `export_song.pb` | the exporter that wrote `theme.wkmu` from the game's own source (not needed to build) |
 | `version.n64`, `build.ps1` | the version on screen (the build number is the compiler's: `@build`); a headless build, not needed in the IDE |
+| `Lato-Regular.ttf`, `OFL.txt` | the text's font (the cartridge's last file) and its licence |
+
+`TrueTypeDemo/truetype_demo.n64` is the template for a cartridge with text:
+the font and its licence beside the source, and the four lines marked `FONT`.
 
 **Building *The Warden's March*:** open `WardensMarch/wardens_march.n64` in the
 IDE and compile, or
@@ -164,8 +181,13 @@ published here with the demo.
 
 - **The CPU (VR4300)** runs the PureMetal program: MIPS III, 64-bit registers,
   compiled by Forge's VR4300 back end.
-- **The RDP** draws everything: fill rectangles for the copper bars, stars and
-  text, shaded triangles for the torus and the sky. Each frame's command list is
+- **The RDP** draws everything: fill rectangles for the copper bars and stars,
+  shaded triangles for the torus and the sky, and the text - each Lato glyph
+  an 8-bit texture, loaded into TMEM and drawn by a texture rectangle, the
+  colour blended by the glyph's coverage.
+- **The text** is made on the console: the font file is read from the
+  cartridge, and each glyph is rasterized by PureMetal's TrueType library (the
+  one PureMetal's Anvil OS uses) the first time it is drawn, then kept. Each frame's command list is
   built while the RDP draws the previous one.
 - **The AI** plays 16-bit stereo at 48 kHz from buffers the program keeps full.
 - **The RSP** (in *The Warden's March*) is shared between two microcode
@@ -174,4 +196,6 @@ published here with the demo.
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE). **Lato** (`Lato-Regular.ttf`) is by Łukasz
+Dziedzic and licensed under the SIL Open Font License 1.1 - see `OFL.txt`
+beside each copy. It is included unmodified.

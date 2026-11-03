@@ -28,12 +28,16 @@
 ;  github.com/ajtaji/PureMetal-N64-Demo-Cartridges).
 ; ======================================================================
 XIncludeFile "Mips/Lib/n64.n64"
-XIncludeFile "fuzz_font.n64"
+XIncludeFile "Mips/Lib/n64_ttf.n64"
 XIncludeFile "version.n64"
 
 ASM
   .rspfile "fuzz.rsp"
+  .cartfile "Lato-Regular.ttf"          ; the screen's font, the last file (OFL.txt beside it)
 EndASM
+
+Global fontOk.i, tableSize.i, titleSize.i
+Global Dim txt.a[48]
 
 #OPS = 23
 #CASES = 4                              ; a run: one instruction, these many cases
@@ -168,86 +172,80 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  THE SCREEN
 ; ----------------------------------------------------------------------
-Procedure DrawGlyph(ch.i, x.i, y.i)
-  Protected r.i, bits.i, col.i, g.i, run.i
-  If ch < 32 Or ch > 95 : ProcedureReturn : EndIf
-  g = ?Font + ((ch - 32) * 8)
-  For r = 0 To 6
-    bits = PeekA(g + r)
-    col = 0
-    While bits <> 0
-      If bits & $80
-        run = 0
-        While bits & $80
-          run = run + 1 : bits = (bits << 1) & 255
-        Wend
-        RdpFillRect(x + col, y + r, x + col + run - 1, y + r)
-        col = col + run
-      Else
-        bits = (bits << 1) & 255 : col = col + 1
-      EndIf
-    Wend
-  Next
+; n characters from address t as a text (txt), trailing spaces dropped
+Procedure.i TextN(t.i, n.i)
+  Protected k.i, m.i = 0
+  For k = 0 To n - 1 : txt[k] = PeekA(t + k) : If txt[k] <> 32 : m = k + 1 : EndIf : Next
+  txt[m] = 0
+  ProcedureReturn @txt[0]
 EndProcedure
 
-Procedure.i DrawText(t.i, n.i, x.i, y.i)       ; n characters from address t
-  Protected k.i
-  For k = 0 To n - 1 : DrawGlyph(PeekA(t + k), x, y) : x = x + 6 : Next
-  ProcedureReturn x
-EndProcedure
-
-Procedure.i DrawHex(v.i, digits.i, x.i, y.i)
+Procedure.i HexText(v.i, digits.i)
   Protected k.i, d.i
-  For k = digits - 1 To 0 Step -1
-    d = (v >> (k * 4)) & 15
-    If d > 9 : DrawGlyph(d + 55, x, y) : Else : DrawGlyph(d + 48, x, y) : EndIf
-    x = x + 6
+  For k = 0 To digits - 1
+    d = (v >> ((digits - 1 - k) * 4)) & 15
+    If d > 9 : txt[k] = d + 55 : Else : txt[k] = d + 48 : EndIf
   Next
-  ProcedureReturn x
+  txt[digits] = 0
+  ProcedureReturn @txt[0]
 EndProcedure
 
-Procedure.i DrawNum(n.i, x.i, y.i)
-  Protected d.i = 1
-  While d * 10 <= n : d = d * 10 : Wend
-  While d > 0
-    DrawGlyph(48 + ((n / d) % 10), x, y)
-    x = x + 6 : d = d / 10
+Procedure.i NumText(n.i)
+  Protected i.i = 22
+  txt[23] = 0
+  If n <= 0 : txt[22] = 48 : ProcedureReturn @txt[22] : EndIf
+  While n > 0 And i >= 0
+    txt[i] = 48 + (n % 10) : n = n / 10 : i = i - 1
   Wend
-  ProcedureReturn x
+  ProcedureReturn @txt[i + 1]
 EndProcedure
 
 Procedure DrawScreen()
-  Protected op.i, x.i, y.i
+  Protected op.i, x.i, y.i, col.i
   RdpFillColor(N64Rgb16(8, 10, 24)) : RdpFillRect(0, 0, #N64_W - 1, #N64_H - 1)
-  RdpFillColor(N64Rgb16(255, 210, 80))
-  DrawText(?TitleText, 30, 16, 8)
-  RdpFillColor(N64Rgb16(200, 200, 220))
-  x = DrawText(?CasesText, 6, 16, 20) : x = DrawNum(caseN, x, 20) : x = DrawText(?OfText, 4, x, 20) : DrawNum(#RUNS * #CASES, x, 20)
+  If fontOk = 0 : ProcedureReturn : EndIf
+  N64TextRdpMode()
+  N64FontUse(titleSize)
+  N64TextRdp(16, 24, TextN(?TitleText, 30), $FFD250)
+  N64FontUse(tableSize)
+  x = N64TextRdp(16, 42, TextN(?CasesText, 6), $C8C8DC)
+  x = N64TextRdp(x + 3, 42, NumText(caseN), $C8C8DC)
+  x = N64TextRdp(x, 42, TextN(?OfText, 4), $C8C8DC)
+  N64TextRdp(x + 3, 42, NumText(#RUNS * #CASES), $C8C8DC)
   If fail
-    RdpFillColor(N64Rgb16(255, 80, 80)) : DrawText(?FailText, 32, 16, 120)
+    N64TextRdp(16, 126, TextN(?FailText, 32), $FF5050)
     ProcedureReturn
   EndIf
+  ; two columns of up to 12: the name, the function code, the checksum
   For op = 0 To #OPS - 1
-    y = 34 + (op * 8)
-    If op < 2 : RdpFillColor(N64Rgb16(120, 200, 255)) : Else : RdpFillColor(N64Rgb16(220, 220, 220)) : EndIf
-    DrawText(?OpTable + (op * 8) + 1, 6, 16, y)
-    DrawHex(PeekA(?OpTable + (op * 8)) & 63, 2, 64, y)
+    col = 16 : y = 64 + (op * 13)
+    If op >= 12 : col = 168 : y = 64 + ((op - 12) * 13) : EndIf
+    If op < 2 : x = $78C8FF : Else : x = $DCDCDC : EndIf
+    N64TextRdp(col, y, ?OpTable + (op * 8) + 1, x)
+    N64TextRdp(col + 50, y, HexText(PeekA(?OpTable + (op * 8)) & 63, 2), x)
     If runN >= (op + 1) * 32
-      RdpFillColor(N64Rgb16(120, 255, 140)) : DrawHex(opCrc(op) ! $FFFFFFFF, 8, 88, y)
+      N64TextRdp(col + 72, y, HexText(opCrc(op) ! $FFFFFFFF, 8), $78FF8C)
     EndIf
   Next
   If runN >= #RUNS
-    RdpFillColor(N64Rgb16(255, 210, 80))
-    x = DrawText(?AllText, 4, 16, 222) : DrawHex(allCrc ! $FFFFFFFF, 8, x, 222)
+    x = N64TextRdp(16, 226, TextN(?AllText, 4), $FFD250)
+    N64TextRdp(x + 3, 226, HexText(allCrc ! $FFFFFFFF, 8), $FFD250)
   EndIf
-  RdpFillColor(N64Rgb16(140, 140, 160))
-  DrawGlyph(86, 256, 228) : x = DrawNum(#DEMO_MAJOR, 262, 228) : DrawGlyph(46, x, 228) : x = DrawNum(#DEMO_MINOR, x + 6, 228) : DrawGlyph(46, x, 228) : DrawNum(#DEMO_BUILD, x + 6, 228)
+  x = N64TextRdp(262, 226, ?VeeText, $8C8CA0)
+  x = N64TextRdp(x, 226, NumText(#DEMO_MAJOR), $8C8CA0)
+  x = N64TextRdp(x, 226, ?DotText, $8C8CA0)
+  x = N64TextRdp(x, 226, NumText(#DEMO_MINOR), $8C8CA0)
+  x = N64TextRdp(x, 226, ?DotText, $8C8CA0)
+  N64TextRdp(x, 226, NumText(#DEMO_BUILD), $8C8CA0)
+  RdpFillMode()
 EndProcedure
 
 ; ----------------------------------------------------------------------
 Procedure Main()
   Protected op.i, k.i, e.i, v.i
   N64VideoInit()
+  fontOk = N64FontOpen(N64CartFile(N64CartFiles() - 1), N64CartFileLen(N64CartFiles() - 1))
+  titleSize = N64FontSize(16) : tableSize = N64FontSize(12)
   For op = 0 To #OPS - 1 : opCrc(op) = $FFFFFFFF : Next
   If N64RspLoad(N64CartFile(0)) = 0 : fail = 1 : EndIf
   If fail = 0
@@ -319,6 +317,10 @@ OfText:
   Data.a 32, 79, 70, 32                         ;  OF
 AllText:
   Data.a 65, 76, 76, 32                         ; ALL
+VeeText:
+  Data.a 86, 0                                  ; V
+DotText:
+  Data.a 46, 0                                  ; .
 FailText:
   Data.a 84, 72, 69, 32, 82, 83, 80, 32, 80, 82, 79, 71, 82, 65, 77, 32, 68, 73, 68, 32, 78, 79, 84, 32, 76, 79, 65, 68, 32, 32, 32, 32   ; THE RSP PROGRAM DID NOT LOAD
 EndDataSection

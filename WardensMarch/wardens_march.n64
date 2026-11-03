@@ -24,6 +24,7 @@
 ;  what is being drawn.
 ; ======================================================================
 XIncludeFile "Mips/Lib/n64.n64"
+XIncludeFile "Mips/Lib/n64_ttf.n64"
 XIncludeFile "wardens_assets.n64"
 XIncludeFile "version.n64"
 XIncludeFile "wk_rsp.n64"
@@ -32,7 +33,11 @@ ASM
   .cartfile "theme.wkmu"
   .rspfile "wk_synth.rsp"
   .rspfile "gfx_torus.rsp"
+  .cartfile "Lato-Regular.ttf"          ; the text's font, the last file (OFL.txt beside it)
 EndASM
+
+Global fontOk.i, titleSize.i, scrollSize.i, hudSize.i
+Global Dim numBuf.a[24]
 
 #STARS = 56
 #TU = 16                                ; the torus: segments around
@@ -467,101 +472,92 @@ Procedure DrawTorus()
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  TEXT: a 5 x 7 glyph, `s` pixels a dot, in the current fill colour
+;  TEXT: Lato (Mips/Lib/n64_ttf.n64), each glyph a texture the RDP blends
+;  in. Every glyph a text here uses is made at the start (FontStart), so no
+;  frame waits for the rasterizer while the music plays.
 ; ----------------------------------------------------------------------
-Procedure DrawGlyph(ch.i, x.i, y.i, s.i)
-  Protected r.i, bits.i, col.i, g.i, run.i
-  If ch < 32 Or ch > 95 : ProcedureReturn : EndIf
-  If x > #N64_W Or x < -6 * s : ProcedureReturn : EndIf
-  g = ?Font + ((ch - 32) * 8)
-  For r = 0 To 6
-    bits = PeekA(g + r)
-    col = 0
-    While bits <> 0
-      If bits & $80
-        ; a run of dots is one rectangle
-        run = 0
-        While bits & $80
-          run = run + 1 : bits = (bits << 1) & 255
-        Wend
-        RdpFillRect(x + (col * s), y + (r * s), x + ((col + run) * s) - 1, y + (r * s) + s - 1)
-        col = col + run
-      Else
-        bits = (bits << 1) & 255 : col = col + 1
-      EndIf
-    Wend
-  Next
+Procedure FontStart()
+  Protected i.i
+  fontOk = N64FontOpen(N64CartFile(N64CartFiles() - 1), N64CartFileLen(N64CartFiles() - 1))
+  If fontOk = 0 : ProcedureReturn : EndIf
+  titleSize = N64FontSize(26) : N64FontPrepare(?TitleText)
+  scrollSize = N64FontSize(24) : N64FontPrepare(?ScrollText)
+  hudSize = N64FontSize(10)
+  N64FontPrepare(?HudHear1) : N64FontPrepare(?HudHear2) : N64FontPrepare(?HudHear3) : N64FontPrepare(?HudVoices)
+  N64FontPrepare(?HudOf) : N64FontPrepare(?HudFm) : N64FontPrepare(?HudWave) : N64FontPrepare(?HudRev1)
+  N64FontPrepare(?HudRev2) : N64FontPrepare(?HudRev3) : N64FontPrepare(?HudSee) : N64FontPrepare(?HudMade)
+  N64FontPrepare(?HudDigits)
+  For i = 0 To #CAP_N - 1 : N64FontPrepare(CapLine(i, 0)) : N64FontPrepare(CapLine(i, 1)) : N64FontPrepare(CapLine(i, 2)) : Next
+EndProcedure
+
+; a number as text (numBuf)
+Procedure.i NumText(n.i)
+  Protected i.i = 22
+  numBuf[23] = 0
+  If n <= 0 : numBuf[22] = 48 : ProcedureReturn @numBuf[22] : EndIf
+  While n > 0 And i >= 0
+    numBuf[i] = 48 + (n % 10) : n = n / 10 : i = i - 1
+  Wend
+  ProcedureReturn @numBuf[i + 1]
+EndProcedure
+
+; caption cap's line l (0-2) as text: the 12 characters, trailing spaces dropped
+Global Dim capBuf.a[16]
+Procedure.i CapLine(cap.i, l.i)
+  Protected t.i = ?CapText + (cap * #CAP_W) + (l * 12), k.i, n.i = 0
+  For k = 0 To 11 : capBuf[k] = PeekA(t + k) : If capBuf[k] <> 32 : n = k + 1 : EndIf : Next
+  capBuf[n] = 0
+  ProcedureReturn @capBuf[0]
 EndProcedure
 
 Procedure DrawTitle()
-  Protected i.i, c.i, x.i, y.i, drop.i
-  RdpFillMode()
+  Protected i.i, c.i, x.i, y.i, drop.i, w.i
+  If fontOk = 0 : ProcedureReturn : EndIf
+  N64TextRdpMode()
+  N64FontUse(titleSize)
   drop = 0
   If frame < 120 : drop = (120 - frame) * 2 : EndIf
+  x = 160 - (N64TextWidth(?TitleText) / 2)
   For i = 0 To #TITLE_LEN - 1
     c = PeekA(?TitleText + i)
-    x = 160 - ((#TITLE_LEN * 12) / 2) + (i * 12)
-    y = 10 - drop + ((Sin14((frame * 4) + (i * 18)) * (3 + (pulse >> 5))) >> 14)
-    RdpFillColor(N64Rgb16(0, 0, 0))
-    DrawGlyph(c, x + 1, y + 1, 2)
-    RdpFillColor(Rgb16Of(Hue((frame * 3) + (i * 14), 255)))
-    DrawGlyph(c, x, y, 2)
+    y = 30 - drop + ((Sin14((frame * 4) + (i * 18)) * (3 + (pulse >> 5))) >> 14)
+    N64CharRdp(x + 1, y + 1, c, $000000)
+    x = N64CharRdp(x, y, c, Hue((frame * 3) + (i * 14), 255))
   Next
 EndProcedure
 
 ; The shadows first, all of them, then the letters: a letter's shadow must
 ; never land on the letter before it.
 Procedure DrawScroller()
-  Protected i.i, c.i, x.i, y.i, first.i, sub.i, pos.i, pass.i
-  RdpFillMode()
-  pos = frame * 2
-  first = pos / 18 : sub = pos % 18
-  RdpFillColor(N64Rgb16(0, 0, 0))
+  Protected i.i, c.i, x.i, y.i, w.i, pass.i, total.i, start.i
+  If fontOk = 0 : ProcedureReturn : EndIf
+  N64TextRdpMode()
+  N64FontUse(scrollSize)
+  total = N64TextWidth(?ScrollText)
+  If total <= 0 : ProcedureReturn : EndIf
+  start = #N64_W - ((frame * 2) % (total + #N64_W))
   For pass = 0 To 1
-    For i = 0 To 18
-      c = PeekA(?ScrollText + ((first + i) % #SCROLL_LEN))
-      x = (i * 18) - sub
-      y = 204 + ((Sin14(x + (frame * 4)) * 7) >> 14)
-      If pass = 0
-        DrawGlyph(c, x + 2, y + 2, 3)
-      Else
-        RdpFillColor(Rgb16Of(Hue((x >> 1) + (frame * 2), 255)))
-        DrawGlyph(c, x, y, 3)
+    x = start
+    For i = 0 To #SCROLL_LEN - 1
+      c = PeekA(?ScrollText + i)
+      w = N64CharWidth(c)
+      If x + w >= 0
+        y = 219 + ((Sin14(x + (frame * 4)) * 6) >> 14)
+        If pass = 0
+          N64CharRdp(x + 2, y + 2, c, $000000)
+        Else
+          N64CharRdp(x, y, c, Hue((x >> 1) + (frame * 2), 255))
+        EndIf
       EndIf
+      x = x + w
+      If x >= #N64_W : Break : EndIf
     Next
   Next
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  THE HUD: what is heard on the left, what is drawn on the right, at one
-;  pixel a dot (6 pixels a character)
+;  THE HUD: what is heard on the left, what is drawn on the right
 ; ----------------------------------------------------------------------
-Procedure.i DrawText(t.i, x.i, y.i)
-  Protected c.i = PeekA(t)
-  While c <> 0
-    DrawGlyph(c, x, y, 1)
-    x = x + 6 : t = t + 1 : c = PeekA(t)
-  Wend
-  ProcedureReturn x
-EndProcedure
-
-Procedure DrawVersion(x.i, y.i)
-  DrawGlyph(86, x, y, 1) : x = x + 6                 ; "V"
-  x = DrawNum(#DEMO_MAJOR, x, y) : DrawGlyph(46, x, y, 1) : x = x + 6
-  x = DrawNum(#DEMO_MINOR, x, y) : DrawGlyph(46, x, y, 1) : x = x + 6
-  DrawNum(#DEMO_BUILD, x, y)
-EndProcedure
-
-Procedure.i DrawNum(n.i, x.i, y.i)
-  Protected d.i = 1
-  While d * 10 <= n : d = d * 10 : Wend
-  While d > 0
-    DrawGlyph(48 + ((n / d) % 10), x, y, 1)
-    x = x + 6 : d = d / 10
-  Wend
-  ProcedureReturn x
-EndProcedure
-
 ; THE HUD'S WORDS CHANGE ONLY WITH THE CAPTION (every four seconds), so they
 ; are drawn once into a command block of their own (HudRecord: the RDP
 ; commands DrawGlyph makes, written to #HUD_BLOCK instead of the frame's
@@ -573,40 +569,41 @@ EndProcedure
 Global hudLen.i, hudCap.i = -1
 
 Procedure HudRecord(cap.i)
-  Protected keepPtr.i = N64RdpPtr, keepEnd.i = N64RdpListEnd, i.i, k.i, t.i
+  Protected keepPtr.i = N64RdpPtr, keepEnd.i = N64RdpListEnd, i.i, x.i
   N64RdpPtr = #HUD_BLOCK : N64RdpListEnd = #HUD_BLOCK + $FF00
   RdpFillMode()
   ; the backing panels
   RdpFillColor(N64Rgb16(8, 8, 24))
   RdpFillRect(2, 32, 69, 175)
   RdpFillRect(248, 32, 319, 101)
-  ; what is heard
-  RdpFillColor(N64Rgb16(255, 220, 90))
-  DrawText(?HudHear1, 6, 36)
-  DrawText(?HudRev1, 6, 142)
-  DrawText(?HudSee, 252, 36)
-  RdpFillColor(N64Rgb16(220, 220, 220))
-  DrawText(?HudHear2, 6, 46)
-  DrawText(?HudHear3, 6, 55)
-  DrawText(?HudVoices, 6, 69)
-  DrawText(?HudRev2, 6, 152)
-  DrawText(?HudRev3, 6, 161)
-  ; what is drawn: the caption
-  t = ?CapText + (cap * #CAP_W)
-  For i = 0 To 2
-    For k = 0 To 11
-      DrawGlyph(PeekA(t + (i * 12) + k), 252 + (k * 6), 50 + (i * 10), 1)
+  If fontOk
+    N64TextRdpMode()
+    N64FontUse(hudSize)
+    ; what is heard
+    N64TextRdp(6, 43, ?HudHear1, $FFDC5A)
+    N64TextRdp(6, 149, ?HudRev1, $FFDC5A)
+    N64TextRdp(252, 43, ?HudSee, $FFDC5A)
+    N64TextRdp(6, 53, ?HudHear2, $DCDCDC)
+    N64TextRdp(6, 62, ?HudHear3, $DCDCDC)
+    N64TextRdp(6, 76, ?HudVoices, $DCDCDC)
+    N64TextRdp(6, 159, ?HudRev2, $DCDCDC)
+    N64TextRdp(6, 168, ?HudRev3, $DCDCDC)
+    ; what is drawn: the caption
+    For i = 0 To 2
+      N64TextRdp(252, 57 + (i * 10), CapLine(cap, i), $DCDCDC)
     Next
-  Next
-  RdpFillColor(N64Rgb16(255, 110, 230))
-  DrawText(?HudFm, 6, 88)
-  RdpFillColor(N64Rgb16(110, 220, 255))
-  DrawText(?HudWave, 6, 97)
-  ; and who made it
-  RdpFillColor(N64Rgb16(255, 255, 255))
-  DrawText(?HudMade, 160 - 99, 232)
-  ; and which build this is (version.n64), bottom right
-  DrawVersion(272, 232)
+    N64TextRdp(6, 95, ?HudFm, $FF6EE6)
+    N64TextRdp(6, 104, ?HudWave, $6EDCFF)
+    ; and who made it, and which build this is (version.n64), at the bottom
+    N64TextRdp(160 - (N64TextWidth(?HudMade) / 2), 238, ?HudMade, $FFFFFF)
+    x = N64TextRdp(286, 238, ?HudVee, $FFFFFF)
+    x = N64TextRdp(x, 238, NumText(#DEMO_MAJOR), $FFFFFF)
+    x = N64TextRdp(x, 238, ?HudDot, $FFFFFF)
+    x = N64TextRdp(x, 238, NumText(#DEMO_MINOR), $FFFFFF)
+    x = N64TextRdp(x, 238, ?HudDot, $FFFFFF)
+    N64TextRdp(x, 238, NumText(#DEMO_BUILD), $FFFFFF)
+    RdpFillMode()
+  EndIf
   hudLen = N64RdpPtr - #HUD_BLOCK
   N64RdpPtr = keepPtr : N64RdpListEnd = keepEnd
   hudCap = cap
@@ -626,24 +623,27 @@ Procedure DrawHud()
   cap = (frame / 240) % #CAP_N
   If cap <> hudCap : HudRecord(cap) : EndIf
   HudReplay()
-  ; the numbers
-  RdpFillColor(N64Rgb16(220, 220, 220))
-  x = DrawNum(wkActive, 6, 78) : DrawText(?HudOf, x, 78)
-  RdpFillColor(N64Rgb16(255, 110, 230))
-  DrawNum(wkActiveFm, 24, 88)
-  RdpFillColor(N64Rgb16(110, 220, 255))
-  DrawNum(wkActiveWave, 36, 97)
+  RdpFillMode()
   ; each instrument: a bar as tall as its voices, coloured by its kind
   For i = 0 To wkNIns - 1
     k = iKind(i) : h = wkInsActive(i) * 5 : If h > 25 : h = 25 : EndIf
     If k = 3 : RdpFillColor(N64Rgb16(255, 110, 230)) : ElseIf k = 2 : RdpFillColor(N64Rgb16(230, 230, 230)) : Else : RdpFillColor(N64Rgb16(110, 220, 255)) : EndIf
     RdpFillRect(6 + (i * 5), 134 - h, 9 + (i * 5), 134)
   Next
+  ; the numbers
+  If fontOk
+    N64TextRdpMode()
+    N64FontUse(hudSize)
+    x = N64TextRdp(6, 85, NumText(wkActive), $DCDCDC) : N64TextRdp(x, 85, ?HudOf, $DCDCDC)
+    N64TextRdp(10 + N64TextWidth(?HudFm), 95, NumText(wkActiveFm), $FF6EE6)
+    N64TextRdp(10 + N64TextWidth(?HudWave), 104, NumText(wkActiveWave), $6EDCFF)
+  EndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
 Procedure Main()
   N64VideoInit()
+  FontStart()                             ; (before the music: the glyphs are made here)
   WsStart(N64CartFile(0), N64CartFile(1))
   InitStars()
   InitTorus()

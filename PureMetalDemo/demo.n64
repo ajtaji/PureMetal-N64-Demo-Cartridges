@@ -9,14 +9,20 @@
 ;  objects lit by their faces' angle to the viewer (a cube, and an octahedron
 ;  going round it), a colour-cycling title, a sine-wave scroller, and a
 ;  four-voice synthesiser - pulse lead, saw arpeggio, square bass and drums -
-;  playing an original tune through the audio interface.
+;  playing an original tune through the audio interface. The text is Lato
+;  (Mips/Lib/n64_ttf.n64), each glyph a texture the RDP blends in.
 ;
 ;  Every table it reads (sine, font, note steps, the song, the message) is in
 ;  demo_assets.n64, written by make_demo_assets.py.
 ; ======================================================================
 XIncludeFile "Mips/Lib/n64.n64"
+XIncludeFile "Mips/Lib/n64_ttf.n64"
 XIncludeFile "demo_assets.n64"
 XIncludeFile "version.n64"
+
+ASM
+  .cartfile "Lato-Regular.ttf"                  ; cartridge file 0: the text's font (OFL.txt beside it)
+EndASM
 
 #STARS = 48
 #AUDIO_SAMPLES = 368                    ; a buffer: 368 stereo samples, 1472 bytes
@@ -24,6 +30,8 @@ XIncludeFile "version.n64"
 #AUDIO_BUFS = 3
 
 Global frame.i
+Global fontOk.i, titleSize.i, scrollSize.i, smallSize.i
+Global Dim numBuf.a[24]
 Global Dim starX.i(#STARS)
 Global Dim starY.i(#STARS)
 Global Dim starV.i(#STARS)
@@ -76,24 +84,20 @@ Procedure.i Hue16(h.i)
   ProcedureReturn N64Rgb16(r, g, b)
 EndProcedure
 
-; ----------------------------------------------------------------------
-;  text: an 8x8 glyph drawn with fill rectangles, `scale` pixels a dot
-; ----------------------------------------------------------------------
-Procedure DrawGlyph(c.i, x.i, y.i, scale.i)
-  Protected rowI.i, bits.i, col.i, g.i
-  If c < 32 Or c > 95 : ProcedureReturn : EndIf
-  If x > #N64_W Or x < -8 * scale : ProcedureReturn : EndIf
-  g = ?Font + ((c - 32) * 8)
-  For rowI = 0 To 7
-    bits = PeekA(g + rowI)
-    If bits <> 0
-      For col = 0 To 7
-        If (bits & ($80 >> col)) <> 0
-          RdpFillRect(x + (col * scale), y + (rowI * scale), x + (col * scale) + scale - 1, y + (rowI * scale) + scale - 1)
-        EndIf
-      Next
-    EndIf
-  Next
+; a colour from a hue 0-255 at full saturation, as $RRGGBB (for the text)
+Procedure.i HueRgb(h.i)
+  Protected r.i, g.i, b.i, k.i
+  h = h & 255
+  k = (h % 43) * 6
+  Select h / 43
+    Case 0 : r = 255 : g = k : b = 0
+    Case 1 : r = 255 - k : g = 255 : b = 0
+    Case 2 : r = 0 : g = 255 : b = k
+    Case 3 : r = 0 : g = 255 - k : b = 255
+    Case 4 : r = k : g = 0 : b = 255
+    Default : r = 255 : g = 0 : b = 255 - k
+  EndSelect
+  ProcedureReturn (r << 16) | (g << 8) | b
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -223,46 +227,57 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  the title and the scroller
 ; ----------------------------------------------------------------------
-; the version (version.n64), bottom right, in the title's colours
-Procedure DrawVersionNum(n.i, x.i, y.i)
-  Protected d.i = 1
-  While d * 10 <= n : d = d * 10 : Wend
-  While d > 0
-    DrawGlyph(48 + ((n / d) % 10), x, y, 1) : x = x + 8 : d = d / 10
+; a number as text (numBuf), for the version
+Procedure.i NumText(n.i)
+  Protected i.i = 22
+  numBuf[23] = 0
+  If n = 0 : numBuf[22] = 48 : ProcedureReturn @numBuf[22] : EndIf
+  While n > 0 And i >= 0
+    numBuf[i] = 48 + (n % 10) : n = n / 10 : i = i - 1
   Wend
-  ProcedureReturn x
-EndProcedure
-Procedure DrawVersion()
-  Protected x.i = 262
-  RdpFillColor(N64Rgb16(200, 200, 200))
-  DrawGlyph(86, x, 230, 1) : x = x + 8
-  x = DrawVersionNum(#DEMO_MAJOR, x, 230) : DrawGlyph(46, x, 230, 1) : x = x + 8
-  x = DrawVersionNum(#DEMO_MINOR, x, 230) : DrawGlyph(46, x, 230, 1) : x = x + 8
-  DrawVersionNum(#DEMO_BUILD, x, 230)
+  ProcedureReturn @numBuf[i + 1]
 EndProcedure
 
+; the version (version.n64), bottom right
+Procedure DrawVersion()
+  Protected x.i = 272
+  N64FontUse(smallSize)
+  x = N64TextRdp(x, 233, "v", $C8C8C8)
+  x = N64TextRdp(x, 233, NumText(#DEMO_MAJOR), $C8C8C8)
+  x = N64TextRdp(x, 233, ".", $C8C8C8)
+  x = N64TextRdp(x, 233, NumText(#DEMO_MINOR), $C8C8C8)
+  x = N64TextRdp(x, 233, ".", $C8C8C8)
+  N64TextRdp(x, 233, NumText(#DEMO_BUILD), $C8C8C8)
+EndProcedure
+
+; "PureMetal", each letter its own colour and height, the colours walking
 Procedure DrawTitle()
   Protected i.i, c.i, x.i
-  ; "PUREMETAL", 3x, each letter its own colour, the colours walking
+  N64FontUse(titleSize)
+  x = (#N64_W - N64TextWidth(?TitleText)) / 2
   For i = 0 To 8
     c = PeekA(?TitleText + i)
-    x = 24 + (i * 30)
-    RdpFillColor(Hue16((frame * 3) + (i * 28)))
-    DrawGlyph(c, x, 8 + ((Sin14((frame * 4) + (i * 24)) * 4) >> 14), 3)
+    x = N64CharRdp(x, 44 + ((Sin14((frame * 4) + (i * 24)) * 4) >> 14), c, HueRgb((frame * 3) + (i * 28)))
   Next
 EndProcedure
 
+; the message, scrolling left along a sine, each letter coloured by where it is
 Procedure DrawScroller()
-  Protected i.i, c.i, x.i, y.i, start.i, sub.i, msgLen.i = 0
+  Protected i.i, c.i, x.i, w.i, y.i, msgLen.i = 0, total.i = 0
+  N64FontUse(scrollSize)
   While PeekA(?ScrollText + msgLen) <> 0 : msgLen = msgLen + 1 : Wend
-  start = (frame * 2) / 16
-  sub = (frame * 2) % 16
-  For i = 0 To 21
-    c = PeekA(?ScrollText + ((start + i) % msgLen))
-    x = (i * 16) - sub
-    y = 196 + ((Sin14((x * 2) + (frame * 5)) * 14) >> 14)
-    RdpFillColor(Hue16((x >> 1) + frame))
-    DrawGlyph(c, x, y, 2)
+  total = N64TextWidth(?ScrollText)
+  If total <= 0 : ProcedureReturn : EndIf
+  x = #N64_W - ((frame * 2) % (total + #N64_W))
+  For i = 0 To msgLen - 1
+    c = PeekA(?ScrollText + i)
+    w = N64CharWidth(c)
+    If x + w >= 0 And x < #N64_W
+      y = 214 + ((Sin14((x * 2) + (frame * 5)) * 14) >> 14)
+      N64CharRdp(x, y, c, HueRgb((x >> 1) + frame))
+    EndIf
+    x = x + w
+    If x >= #N64_W : Break : EndIf
   Next
 EndProcedure
 
@@ -359,6 +374,8 @@ Procedure Main()
   N64VideoInit()
   N64AudioInit(#DEMO_RATE)
   InitStars()
+  fontOk = N64FontOpen(N64CartFile(0), N64CartFileLen(0))
+  titleSize = N64FontSize(44) : scrollSize = N64FontSize(22) : smallSize = N64FontSize(11)
   Repeat
     PumpAudio()
     RdpBegin()
@@ -367,9 +384,13 @@ Procedure Main()
     DrawBackground()
     DrawStars()
     DrawObjects()
-    DrawTitle()
-    DrawScroller()
-    DrawVersion()
+    If fontOk
+      N64TextRdpMode()
+      DrawTitle()
+      DrawScroller()
+      DrawVersion()
+      RdpFillMode()
+    EndIf
     RdpRun()
     PumpAudio()
     N64WaitVBlank()
@@ -382,5 +403,5 @@ Main()
 
 DataSection
 TitleText:
-  Data.a 80, 85, 82, 69, 77, 69, 84, 65, 76    ; PUREMETAL
+  Data.a 80, 117, 114, 101, 77, 101, 116, 97, 108, 0   ; PureMetal
 EndDataSection

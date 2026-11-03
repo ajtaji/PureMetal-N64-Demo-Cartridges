@@ -1,0 +1,85 @@
+; ======================================================================
+;  truetype_demo.n64 - TrueType text on the Nintendo 64, in Lato
+; ======================================================================
+;  Built by PureMetal Forge for the VR4300 (the Nintendo 64 board): open it in
+;  the IDE and Compile, or
+;      PureMetalForge.exe --compile truetype_demo.n64 -o TrueTypeDemo.bin
+;  writes TrueTypeDemo.z64.
+;
+;  Lato Regular (Lato-Regular.ttf, beside this file, SIL Open Font License -
+;  OFL.txt) goes on the cartridge whole; Mips/Lib/n64_ttf.n64 - Anvil's
+;  TrueType library on the VR4300 - rasterizes each glyph the first time it is
+;  drawn, at three sizes, and the RDP draws them - textures blended over its
+;  own background. The template for a cartridge with text: copy the font,
+;  its licence and the four lines marked FONT.
+; ======================================================================
+XIncludeFile "Mips/Lib/n64.n64"
+XIncludeFile "Mips/Lib/n64_ttf.n64"                  ; FONT
+XIncludeFile "version.n64"
+
+ASM
+  .cartfile "Lato-Regular.ttf"                       ; FONT (cartridge file 0)
+EndASM
+
+Global big.i, mid.i, small.i, frame.i, ok.i
+Global Dim digits.a[24]
+
+; A number as text in digits, for N64Text.
+Procedure.i NumText(n.i)
+  Protected i.i = 22, k.i
+  digits[23] = 0
+  If n = 0 : digits[22] = 48 : ProcedureReturn @digits[22] : EndIf
+  While n > 0 And i >= 0
+    digits[i] = 48 + (n % 10) : n = n / 10 : i = i - 1
+  Wend
+  ProcedureReturn @digits[i + 1]
+EndProcedure
+
+; The frame, all by the RDP: the background (a deep blue to near black, a
+; band), then the text - glyph textures blended over it.
+Procedure DrawFrame()
+  Protected x.i, w.i, slide.i
+  RdpBegin()
+  RdpTarget(N64FbDraw)
+  RdpShadeMode()
+  RdpShadeRect(0, 0, #N64_W - 1, #N64_H - 1, $14284A, $04060C)
+  RdpShadeRect(0, 100, #N64_W - 1, 101, $FFC040, $FF8020)
+  If ok
+    N64TextRdpMode()
+    N64FontUse(big)
+    w = N64TextWidth("PureMetal")
+    N64TextRdp((#N64_W - w) / 2, 64, "PureMetal", $FFD040)
+    N64FontUse(mid)
+    w = N64TextWidth("TrueType on the Nintendo 64")
+    N64TextRdp((#N64_W - w) / 2, 92, "TrueType on the Nintendo 64", $FFFFFF)
+    N64FontUse(small)
+    N64TextRdp(16, 132, "Lato Regular, rasterized on the console by", $A8D8FF)
+    N64TextRdp(16, 150, "Anvil's TrueType library, drawn by the RDP:", $A8D8FF)
+    N64TextRdp(16, 168, "each glyph a texture, blended over the picture.", $A8D8FF)
+    slide = (frame * 2) % (#N64_W + 400)
+    N64TextRdp(#N64_W - slide, 200, "The quick brown fox jumps over the lazy dog.", $D0D0D0)
+    x = N64TextRdp(232, 228, "v", $808898)
+    x = N64TextRdp(x, 228, NumText(#DEMO_MAJOR), $808898)
+    x = N64TextRdp(x, 228, ".", $808898)
+    x = N64TextRdp(x, 228, NumText(#DEMO_MINOR), $808898)
+    x = N64TextRdp(x, 228, ".", $808898)
+    x = N64TextRdp(x, 228, NumText(#DEMO_BUILD), $808898)
+  EndIf
+  RdpRun()
+  RdpWait()
+EndProcedure
+
+Procedure Main()
+  N64VideoInit()
+  ok = N64FontOpen(N64CartFile(0), N64CartFileLen(0))   ; FONT
+  big = N64FontSize(40) : mid = N64FontSize(22) : small = N64FontSize(14)   ; FONT (made as they are drawn)
+  Repeat
+    DrawFrame()
+    If ok = 0 : N64Plot(10, 10, N64Rgb16(255, 0, 0)) : EndIf   ; no font: a red dot
+    N64WaitVBlank()
+    N64Flip()
+    frame = frame + 1
+  ForEver
+EndProcedure
+
+Main()
