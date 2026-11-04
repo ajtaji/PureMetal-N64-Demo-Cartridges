@@ -1,4 +1,4 @@
 ; version.n64 - the version on screen. The compiler adds one to the build number on every build (@build).
 #DEMO_MAJOR = 1
 #DEMO_MINOR = 0
-#DEMO_BUILD = 5 ; @build
+#DEMO_BUILD = 5 ; @build

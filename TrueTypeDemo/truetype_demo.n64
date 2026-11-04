@@ -21,7 +21,7 @@ ASM
   .cartfile "Lato-Regular.ttf"                       ; FONT (cartridge file 0)
 EndASM
 
-Global big.i, mid.i, small.i, frame.i, ok.i
+Global big.i, medium.i, small.i, frame.i, ok.i
 Global Dim digits.a[24]
 
 ; A number as text in digits, for N64Text.
@@ -49,7 +49,7 @@ Procedure DrawFrame()
     N64FontUse(big)
     w = N64TextWidth("PureMetal")
     N64TextRdp((#N64_W - w) / 2, 64, "PureMetal", $FFD040)
-    N64FontUse(mid)
+    N64FontUse(medium)
     w = N64TextWidth("TrueType on the Nintendo 64")
     N64TextRdp((#N64_W - w) / 2, 92, "TrueType on the Nintendo 64", $FFFFFF)
     N64FontUse(small)
@@ -72,7 +72,7 @@ EndProcedure
 Procedure Main()
   N64VideoInit()
   ok = N64FontOpen(N64CartFile(0), N64CartFileLen(0))   ; FONT
-  big = N64FontSize(40) : mid = N64FontSize(22) : small = N64FontSize(14)   ; FONT (made as they are drawn)
+  big = N64FontSize(40) : medium = N64FontSize(22) : small = N64FontSize(14)   ; FONT (made as they are drawn)
   Repeat
     DrawFrame()
     If ok = 0 : N64Plot(10, 10, N64Rgb16(255, 0, 0)) : EndIf   ; no font: a red dot
