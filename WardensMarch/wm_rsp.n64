@@ -1,0 +1,38 @@
+; ======================================================================
+;  wm_rsp.n64 - Warden's March: two programs of its own on one RSP
+; ======================================================================
+;  The music (wk_synth.rsp, wk_rsp.n64) and the torus (gfx_torus.rsp) take
+;  turns on the RSP. Each is kept in RDRAM once (WmRspCache) and put back on
+;  the halted RSP when it is its turn (WmRspUse: two SP DMAs). WmRspOwner says
+;  whose program the RSP is running (0 nobody); WmRspWanted is set by a program
+;  waiting for its turn, so the other gives the RSP up at its next block.
+;  The RSP's own procedures are LibPureMetalN64's (lpm_rspq.n64: LpmSpDmaIn /
+;  LpmSpDmaOut, LpmRspHalt, LpmRspRun, LpmRspHalted); the cartridge is read
+;  with LpmPiRead.
+; ======================================================================
+#WM_DMEM = $A4000000                    ; the RSP's data memory, as the CPU sees it
+#WM_AUDIO = $A0340000                   ; the sound buffers (uncached: the AI reads RDRAM)
+Global WmRspOwner.i, WmRspWanted.i
+
+; The .rspfile at cartridge address pi into RDRAM at ram (8-byte aligned,
+; uncached: the SP DMA reads RDRAM; 8 KB + 32): "RSPC", the code's and the
+; data's bytes (rounded to 8), the code at ram + 16, the data after it. 0 when
+; the file is not RSP code.
+Procedure.i WmRspCache(pi.i, ram.i)
+  Protected il.i, dl.i
+  If LpmCartLong(pi) <> $52535043 : ProcedureReturn 0 : EndIf                ; "RSPC"
+  il = LpmCartLong(pi + 4) : dl = LpmCartLong(pi + 8)
+  PokeL(ram, $52535043) : PokeL(ram + 4, (il + 7) & ~7) : PokeL(ram + 8, (dl + 7) & ~7)
+  LpmPiWait(LpmPiRead(pi + 16, ram + 16, (il + 7) & ~7))
+  If dl > 0 : LpmPiWait(LpmPiRead(pi + 16 + il, ram + 16 + ((il + 7) & ~7), (dl + 7) & ~7)) : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; A cached program onto the (halted) RSP: its code, and its data as assembled.
+Procedure WmRspUse(ram.i, owner.i)
+  Protected il.i = PeekL(ram + 4), dl.i = PeekL(ram + 8)
+  LpmRspHalt()
+  LpmSpDmaIn($1000, ram + 16, il)
+  LpmSpDmaIn(0, ram + 16 + il, dl)
+  WmRspOwner = owner
+EndProcedure

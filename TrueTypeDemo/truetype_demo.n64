@@ -1,0 +1,84 @@
+;======================================================================
+;  truetype_demo.n64 - TrueType text on the Nintendo 64, in Lato
+; ======================================================================
+;  Built by PureMetal Forge for the VR4300 (the Nintendo 64 board) on
+;  LibPureMetalN64: the build makes the three fonts (tools/pmfont.py) and then
+;      PureMetalForge.exe --compile truetype_demo.n64 -o TrueTypeDemo.bin
+;  which writes TrueTypeDemo.z64.
+;
+;  Lato Regular (Lato-Regular.ttf, beside this file, SIL Open Font License -
+;  OFL.txt) is made into glyph atlases at three sizes on the PC by
+;  tools/pmfont.py (kerning kept, a quarter-pixel pen), and lpm_font draws them:
+;  each glyph a texture rectangle the RDP blends over its own background.
+;  The template for a cartridge with text: make the fonts as the build does,
+;  put them on the cartridge (.cartfile), LpmFontLoad, LpmTextMode,
+;  LpmTextPrint.
+; ======================================================================
+XIncludeFile "Mips/Lib/LibPureMetalN64/lpm.n64"
+XIncludeFile "Mips/Lib/LibPureMetalN64/lpm_font.n64"
+XIncludeFile "Mips/Lib/LibPureMetalN64/lpm_hwcheck.n64"
+XIncludeFile "version.n64"
+
+ASM
+  .cartfile "ttd_big.pmft"                           ; Lato 40 (cartridge file 0)
+  .cartfile "ttd_medium.pmft"                        ; Lato 22
+  .cartfile "ttd_small.pmft"                         ; Lato 14, four colour styles
+EndASM
+
+#FONT_AT = $80300000                                 ; the fonts, one after another (cached)
+Global big.i, medium.i, small.i, frame.i, ok.i
+
+; A font from the cartridge into RDRAM at at: its handle, or 0.
+Procedure.i LoadFont(n.i, at.i)
+  Protected bytes.i = (LpmCartFileLen(n) + 7) & ~7
+  LpmPiWait(LpmPiRead(LpmCartFile(n), at, bytes))
+  ProcedureReturn LpmFontLoad(at, bytes)
+EndProcedure
+
+; The frame, all by the RDP: the background (a deep blue to near black, a
+; band), then the text - glyph textures blended over it.
+Procedure DrawFrame()
+  Protected fb.i, slide.i
+  fb = LpmDisplayGet()
+  LpmRdpAttach(fb)
+  LpmRdpModeShade()
+  LpmRdpShadeTriangle(0, 0, $14284A, 320, 0, $14284A, 0, 240, $04060C)
+  LpmRdpShadeTriangle(320, 0, $14284A, 320, 240, $04060C, 0, 240, $04060C)
+  LpmRdpShadeTriangle(0, 100, $FFC040, 320, 100, $FF8020, 0, 102, $FFC040)
+  LpmRdpShadeTriangle(320, 100, $FF8020, 320, 102, $FF8020, 0, 102, $FFC040)
+  If ok
+    LpmTextMode()
+    LpmTextParams(0, 0, #LPM_TEXT_CENTER, #LPM_TEXT_TOP, #LPM_TEXT_WRAP_NONE, 0)
+    LpmTextPrint(big, 160, 64 - LpmFontAscent(big), "PureMetal")
+    LpmTextPrint(medium, 160, 92 - LpmFontAscent(medium), "TrueType on the Nintendo 64")
+    LpmTextParams(0, 0, #LPM_TEXT_LEFT, #LPM_TEXT_TOP, #LPM_TEXT_WRAP_NONE, 0)
+    LpmTextPrint(small, 16, 132 - LpmFontAscent(small), "^0Lato Regular, made into glyph atlases by")
+    LpmTextPrint(small, 16, 150 - LpmFontAscent(small), "^0tools/pmfont.py, drawn by the RDP through")
+    LpmTextPrint(small, 16, 168 - LpmFontAscent(small), "^0LibPureMetalN64: each glyph a texture, blended.")
+    slide = (frame * 2) % (320 + 400)
+    LpmTextPrint(small, 320 - slide, 200 - LpmFontAscent(small), "^1The quick brown fox jumps over the lazy dog.")
+    LpmTextPrint(small, 232, 228 - LpmFontAscent(small), "^2v" + Str(#DEMO_MAJOR) + "." + Str(#DEMO_MINOR) + "." + Str(#DEMO_BUILD))
+  Else
+    LpmRdpModeFill(LpmRgb16(255, 0, 0)) : LpmRdpFillRect(10, 10, 14, 14)   ; no font: a red square
+  EndIf
+  LpmRdpDetachShow(fb)
+EndProcedure
+
+Procedure Main()
+  LpmHwRequire()
+  LpmInterruptsInit()
+  LpmDmaInit()
+  LpmDisplayInit(320, 240, 16, 2, #LPM_VI_DEFAULT, #LPM_TV_NTSC)
+  LpmRdpInit()
+  LpmInterruptsOn()
+  big = LoadFont(0, #FONT_AT)
+  medium = LoadFont(1, #FONT_AT + $20000)
+  small = LoadFont(2, #FONT_AT + $38000)
+  ok = Bool(big <> 0 And medium <> 0 And small <> 0)
+  Repeat
+    DrawFrame()
+    frame = frame + 1
+  ForEver
+EndProcedure
+
+Main()

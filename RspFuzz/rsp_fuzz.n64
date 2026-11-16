@@ -1,0 +1,374 @@
+; ======================================================================
+;  rsp_fuzz.n64 - the RSP's reserved vector opcodes, recorded on a console
+; ======================================================================
+;  Built by PureMetal Forge for the VR4300 (the Nintendo 64 board) on
+;  LibPureMetalN64: the two fonts (pmfont.py from Lato-Regular.ttf), then
+;      PureMetalForge.exe --compile rsp_fuzz.n64 -o RspFuzz.bin
+;  which writes RspFuzz.z64. The build marks the ROM header as SRAM 256 Kbit
+;  ("ED" at $3C, $30 at $3F).
+;
+;  WHAT IT IS FOR. Twenty-one of the RSP's 64 vector function codes are not
+;  documented (VSUT, VADDB, VSUBB, VACCB, VSUCB, VSAD, VSAC, VSUM, V30, V31,
+;  V46, V47, VNOP, VEXTT, VEXTQ, VEXTN, V59, VINST, VINSQ, VINSN, VNULL). This
+;  cartridge runs each of them - and two known ones as a control (VADD,
+;  VMULF) - in all 16 element modes, in two pipeline variants (fuzz.rsp), on
+;  4 cases each - one of edge values, three random - and records what the RSP
+;  leaves: vd, the whole accumulator before and after, VCO VCC VCE.
+;  23 x 16 x 2 x 4 = 2944 cases.
+;
+;  THE CPU. COP0 PRId is read first and shown on screen and as the log's first
+;  line, "VR4300 PRId $0B10 - revision 1.0" (bits 15:8 the implementation,
+;  $0B the VR4300; 7:4 and 3:0 the revision, major.minor).
+;
+;  THE RESULTS go out three ways:
+;   - the IS-Viewer log (a SummerCart64 or 64drive): one line a case, the 128
+;     bytes the RSP was given and the 128 it gave back, in hex;
+;   - the screen: each opcode's CRC-32 over its results, and the total;
+;   - the results file, in the cartridge's SRAM (256 Kbit), written once at
+;     the end (lpm_fuzzrec.n64); the screen then says RESULTS SAVED. A
+;     SummerCart64 started from its menu writes the SRAM to the SD card as the
+;     cartridge's .sav file.
+;  The cases come from a fixed seed: the same build gives the same log.
+; ======================================================================
+XIncludeFile "Mips/Lib/LibPureMetalN64/lpm.n64"
+XIncludeFile "Mips/Lib/LibPureMetalN64/lpm_font.n64"
+XIncludeFile "Mips/Lib/LibPureMetalN64/lpm_fuzzrec.n64"
+XIncludeFile "Mips/Lib/LibPureMetalN64/lpm_hwcheck.n64"
+XIncludeFile "version.n64"
+
+ASM
+  .rspfile "fuzz.rsp"
+  .cartfile "fuzz_title.pmft"           ; Lato 16 (tools/pmfont.py from Lato-Regular.ttf, OFL.txt beside it)
+  .cartfile "fuzz_table.pmft"           ; Lato 12, seven colour styles
+EndASM
+
+Global fontOk.i, titleFont.i, tableFont.i
+#FONT_AT = $80340000                    ; the two fonts, loaded once (cached; LpmFontLoad writes back the pages)
+#RSP_AT = $A0360000                     ; the .rspfile on its way to the RSP (uncached: the SP DMA reads RDRAM)
+#N64_DMEM = $A4000000                   ; the RSP's data memory, as the CPU sees it
+
+#OPS = 23
+#CASES = 4                              ; a run: one instruction, these many cases
+#RUNS = #OPS * 16 * 2
+#DMEM_TASK = #N64_DMEM
+#DMEM_IN = #N64_DMEM + 16
+#DMEM_OUT = #N64_DMEM + 16 + 1024
+#IMEM = $A4001000
+
+Global rnd.i = $2545F491
+Global slotA.i, slotB.i, runN.i, caseN.i, allCrc.i = $FFFFFFFF, fail.i
+Global Dim opCrc.i(#OPS)
+Global Dim caseIn.i(32)
+Global Dim runIn.i(#CASES * 32)
+Global isvLen.i
+Global Dim isvLine.b(700)
+
+Global prid.i, saveState.i               ; saveState: 0 not yet, 1 saved and read back, 2 failed
+Global pridText.s, revText.s
+
+; COP0 PRId (15): bits 15:8 the implementation ($0B the VR4300), 7:4 and 3:0 the revision.
+ProcedureNaked.i CpuPrid()
+  ASM
+    mfc0 a0, $15
+    nop
+    dsll32 a0, a0, 0
+    dsrl32 a0, a0, 0
+    jr ra
+    nop
+  EndASM
+EndProcedure
+
+Procedure.i Rnd32()                     ; xorshift32
+  rnd = rnd ! ((rnd << 13) & $FFFFFFFF)
+  rnd = rnd ! (rnd >> 17)
+  rnd = rnd ! ((rnd << 5) & $FFFFFFFF)
+  rnd = rnd & $FFFFFFFF
+  ProcedureReturn rnd
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CRC-32 (the zip one), a word at a time, high byte first
+; ----------------------------------------------------------------------
+Procedure.i Crc32Word(crc.i, w.i)
+  Protected k.i, b.i
+  For k = 3 To 0 Step -1
+    crc = crc ! ((w >> (k * 8)) & 255)
+    For b = 0 To 7
+      If crc & 1 : crc = (crc >> 1) ! $EDB88320 : Else : crc = crc >> 1 : EndIf
+    Next
+  Next
+  ProcedureReturn crc & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE ISVIEWER: a line at a time, through lpm_debug.n64 (IS-Viewer 64: token, GET, PUT, text at +$20)
+; ----------------------------------------------------------------------
+Procedure IsvPut(c.i)
+  If isvLen < 690 : isvLine(isvLen) = c : isvLen = isvLen + 1 : EndIf
+EndProcedure
+Procedure IsvHex(v.i, digits.i)
+  Protected k.i, d.i
+  For k = digits - 1 To 0 Step -1
+    d = (v >> (k * 4)) & 15
+    If d > 9 : IsvPut(d + 55) : Else : IsvPut(d + 48) : EndIf
+  Next
+EndProcedure
+Procedure IsvText(s.s)
+  Protected i.i
+  For i = 1 To Len(s) : IsvPut(Asc(Mid(s, i, 1))) : Next
+EndProcedure
+Procedure IsvFlush()
+  ; the line through LibPureMetalN64's IS-Viewer 64 writer (lpm_debug.n64): the TOKEN, GET and PUT
+  ; the SummerCart64 needs, the PI idle before every access
+  IsvPut(10)
+  LpmDebugWrite(@isvLine(0), isvLen)
+  isvLen = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CASES
+; ----------------------------------------------------------------------
+; Case c of a run: 32 words (vs, vt, vd before, A, B, C, D, then VCO VCC VCE).
+; Case 0 is edge values in vs and vt; the rest are random.
+Procedure MakeCase(c.i)
+  Protected k.i
+  For k = 0 To 27 : caseIn(k) = Rnd32() : Next
+  If c = 0
+    For k = 0 To 3
+      caseIn(k) = ((PeekW(?EdgeS + (k * 4)) & $FFFF) << 16) | (PeekW(?EdgeS + (k * 4) + 2) & $FFFF)
+      caseIn(4 + k) = ((PeekW(?EdgeT + (k * 4)) & $FFFF) << 16) | (PeekW(?EdgeT + (k * 4) + 2) & $FFFF)
+    Next
+  EndIf
+  caseIn(28) = Rnd32()                  ; VCO, VCC
+  caseIn(29) = (Rnd32() & $FF) << 16    ; VCE
+  caseIn(30) = 0 : caseIn(31) = 0
+  For k = 0 To 31 : PokeL(#DMEM_IN + (c * 128) + (k * 4), caseIn(k)) : Next
+EndProcedure
+
+; The RSP's instruction under test, "op $v10, $v8, $v9[e]".
+Procedure.i OpWord(op.i, e.i)
+  ProcedureReturn $4A000000 | ((e & 15) << 21) | (9 << 16) | (8 << 11) | (10 << 6) | (PeekA(?OpTable + (op * 8)) & 63)
+EndProcedure
+
+; THE RSP: fuzz.rsp runs from IMEM 0 until its "break" halts it - the library's
+; LpmRspHalt / LpmRspRun / LpmRspHalted, loaded with LpmPiRead and LpmSpDmaIn.
+; 0 when the cartridge file is not RSP code ("RSPC", code bytes, data bytes, then both)
+Procedure.i FuzzRspLoad(pi.i)
+  Protected il.i, dl.i
+  If LpmCartLong(pi) <> $52535043 : ProcedureReturn 0 : EndIf
+  il = LpmCartLong(pi + 4) : dl = LpmCartLong(pi + 8)
+  LpmRspHalt()
+  LpmPiWait(LpmPiRead(pi + 16, #RSP_AT, (il + 7) & ~7))
+  LpmSpDmaIn($1000, #RSP_AT, (il + 7) & ~7)
+  If dl > 0
+    LpmPiWait(LpmPiRead(pi + 16 + il, #RSP_AT, (dl + 7) & ~7))
+    LpmSpDmaIn(0, #RSP_AT, (dl + 7) & ~7)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; One run: the instruction into both slots, the cases into DMEM, the RSP run,
+; each case's results read back, added to the CRCs, printed and recorded.
+Procedure Run(op.i, e.i, v.i)
+  Protected c.i, k.i, w.i
+  LpmRspHalt()
+  w = OpWord(op, e)
+  PokeL(#IMEM + slotA, w) : PokeL(#IMEM + slotB, w)
+  PokeL(#DMEM_TASK, #CASES) : PokeL(#DMEM_TASK + 4, v)
+  For c = 0 To #CASES - 1
+    MakeCase(c)
+    For k = 0 To 31 : runIn(c * 32 + k) = caseIn(k) : Next
+  Next
+  LpmRspRun(0)
+  While LpmRspHalted() = 0 : Wend
+  For c = 0 To #CASES - 1
+    IsvPut(67) : IsvPut(32) : IsvHex(op, 2) : IsvPut(32) : IsvHex(e, 1) : IsvPut(32) : IsvHex(v, 1) : IsvPut(32) : IsvHex(c, 1) : IsvPut(32)
+    For k = 0 To 31 : IsvHex(runIn(c * 32 + k), 8) : Next
+    IsvPut(32)
+    For k = 0 To 31
+      w = PeekL(#DMEM_OUT + (c * 128) + (k * 4)) & $FFFFFFFF
+      IsvHex(w, 8)
+      opCrc(op) = Crc32Word(opCrc(op), w)
+      allCrc = Crc32Word(allCrc, w)
+      LpmFuzzRecOut(k, w)
+    Next
+    IsvFlush()
+    For k = 0 To 31 : LpmFuzzRecIn(k, runIn(c * 32 + k)) : Next
+    LpmFuzzRecCase(caseN, PeekA(?OpTable + (op * 8)) & 63, e)
+    caseN = caseN + 1
+  Next
+  runN = runN + 1
+EndProcedure
+
+; The two slots' places in IMEM (the words fuzz.rsp leaves for the CPU).
+Procedure FindSlots()
+  Protected k.i, w.i
+  slotA = -1 : slotB = -1
+  For k = 0 To 4092 Step 4
+    w = PeekL(#IMEM + k) & $FFFFFFFF
+    If w = $34001111 : slotA = k : EndIf
+    If w = $34002222 : slotB = k : EndIf
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SCREEN
+; ----------------------------------------------------------------------
+; Text through the library's fonts (lpm_font.n64): the top left at x, y; the
+; colours are the fonts' styles (the build: title style 0 gold; table styles
+; 0 grey-blue, 1 blue, 2 light grey, 3 green, 4 red, 5 dim, 6 gold).
+Global fz_name.s, fz_hex.s             ; OpName's and HexOf's answers (a procedure returns no string)
+
+Procedure OpName(op.i)
+  Protected k.i, c.i
+  fz_name = ""
+  For k = 1 To 6
+    c = PeekA(?OpTable + (op * 8) + k) & 255
+    If c <> 32 : fz_name = fz_name + Chr(c) : EndIf
+  Next
+EndProcedure
+
+Procedure HexOf(v.i, digits.i)
+  Protected h.s = Hex(v & $FFFFFFFF)
+  fz_hex = ""
+  While Len(fz_hex) + Len(h) < digits : fz_hex = fz_hex + "0" : Wend
+  fz_hex = fz_hex + h
+EndProcedure
+
+Procedure DrawScreen()
+  Protected op.i, x.i, y.i, st.s
+  LpmRdpModeFill(LpmRgb16(8, 10, 24)) : LpmRdpFillRect(0, 0, 320, 240)
+  If fontOk = 0 : ProcedureReturn : EndIf
+  LpmTextMode()
+  LpmTextPrint(titleFont, 16, 24 - LpmFontAscent(titleFont), "^0RSP RESERVED OPCODE FUZZ")
+  LpmTextPrint(tableFont, 16, 42 - LpmFontAscent(tableFont), "^0CASES " + Str(caseN) + " OF " + Str(#RUNS * #CASES))
+  If saveState = 1 : LpmTextPrint(tableFont, 208, 42 - LpmFontAscent(tableFont), "^3RESULTS SAVED") : EndIf
+  If saveState = 2 : LpmTextPrint(tableFont, 208, 42 - LpmFontAscent(tableFont), "^4SAVE FAILED") : EndIf
+  ; the CPU, in the table's free corner
+  LpmTextPrint(tableFont, 168, 207 - LpmFontAscent(tableFont), "^0" + pridText)
+  LpmTextPrint(tableFont, 168, 226 - LpmFontAscent(tableFont), "^0" + revText)
+  If fail
+    LpmTextPrint(tableFont, 16, 126 - LpmFontAscent(tableFont), "^4THE RSP PROGRAM DID NOT LOAD")
+    ProcedureReturn
+  EndIf
+  ; two columns of up to 12: the name, the function code, the checksum
+  For op = 0 To #OPS - 1
+    x = 16 : y = 64 + (op * 13)
+    If op >= 12 : x = 168 : y = 64 + ((op - 12) * 13) : EndIf
+    If op < 2 : st = "^1" : Else : st = "^2" : EndIf
+    y = y - LpmFontAscent(tableFont)
+    OpName(op) : LpmTextPrint(tableFont, x, y, st + fz_name)
+    HexOf(PeekA(?OpTable + (op * 8)) & 63, 2) : LpmTextPrint(tableFont, x + 50, y, st + fz_hex)
+    If runN >= (op + 1) * 32
+      HexOf(opCrc(op) ! $FFFFFFFF, 8) : LpmTextPrint(tableFont, x + 72, y, "^3" + fz_hex)
+    EndIf
+  Next
+  If runN >= #RUNS
+    HexOf(allCrc ! $FFFFFFFF, 8) : LpmTextPrint(tableFont, 16, 226 - LpmFontAscent(tableFont), "^6ALL " + fz_hex)
+  EndIf
+  LpmTextPrint(tableFont, 262, 226 - LpmFontAscent(tableFont), "^5V" + Str(#DEMO_MAJOR) + "." + Str(#DEMO_MINOR) + "." + Str(#DEMO_BUILD))
+EndProcedure
+
+; Both fonts from the cartridge (the files after fuzz.rsp), 8-byte aligned, one after the other.
+Procedure.i LoadFont(n.i, at.i)
+  Protected bytes.i = (LpmCartFileLen(n) + 7) & ~7
+  LpmPiWait(LpmPiRead(LpmCartFile(n), at, bytes))
+  ProcedureReturn LpmFontLoad(at, bytes)
+EndProcedure
+
+; ----------------------------------------------------------------------
+Procedure Main()
+  Protected op.i, k.i, e.i, v.i, fb.i, o.i
+  LpmHwRequire()
+  LpmInterruptsInit()
+  LpmDmaInit()
+  LpmDisplayInit(320, 240, 16, 2, #LPM_VI_DEFAULT, #LPM_TV_NTSC)
+  LpmRdpInit()
+  LpmInterruptsOn()
+  titleFont = LoadFont(1, #FONT_AT)
+  tableFont = LoadFont(2, #FONT_AT + $10000)
+  fontOk = Bool(titleFont <> 0 And tableFont <> 0)
+  ; the CPU: PRId on the screen and as the log's first line
+  prid = CpuPrid()
+  HexOf(prid & $FFFF, 4)
+  If ((prid >> 8) & 255) = $0B : pridText = "VR4300 PRId " : Else : pridText = "CPU PRId " : EndIf
+  revText = "revision " + Str((prid >> 4) & 15) + "." + Str(prid & 15)
+  IsvText(pridText + "$" + fz_hex + " - " + revText) : IsvFlush()
+  pridText = pridText + "$$" + fz_hex     ; on the screen "$$" is the character ($X picks a font)
+  LpmFuzzRecBegin()
+  For op = 0 To #OPS - 1 : opCrc(op) = $FFFFFFFF : Next
+  If FuzzRspLoad(LpmCartFile(0)) = 0 : fail = 1 : EndIf
+  If fail = 0
+    FindSlots()
+    If slotA < 0 Or slotB < 0 : fail = 1 : EndIf
+  EndIf
+  op = 0 : e = 0 : v = 0
+  Repeat
+    For k = 0 To 7                      ; eight runs a frame: the screen keeps up
+      If fail = 0 And runN < #RUNS
+        Run(op, e, v)
+        v = v + 1
+        If v = 2 : v = 0 : e = e + 1 : EndIf
+        If e = 16 : e = 0 : op = op + 1 : EndIf
+        If runN = #RUNS
+          IsvPut(69) : IsvPut(78) : IsvPut(68) : IsvPut(32) : IsvHex(allCrc ! $FFFFFFFF, 8) : IsvFlush()
+          For o = 0 To #OPS - 1 : LpmFuzzRecSum(o, opCrc(o) ! $FFFFFFFF) : Next
+          saveState = LpmFuzzRecSave((#DEMO_MAJOR << 24) | (#DEMO_MINOR << 16) | (#DEMO_BUILD & $FFFF), prid, caseN, allCrc ! $FFFFFFFF)
+        EndIf
+      EndIf
+    Next
+    fb = LpmDisplayGet()
+    LpmRdpAttach(fb)
+    DrawScreen()
+    LpmRdpDetachShow(fb)
+  ForEver
+EndProcedure
+
+Main()
+
+DataSection
+; the opcodes: the function code, then the name in 6 characters, then a pad
+OpTable:
+  Data.a 16, 86, 65, 68, 68, 32, 32, 0          ; VADD    (control)
+  Data.a 0, 86, 77, 85, 76, 70, 32, 0           ; VMULF   (control)
+  Data.a 18, 86, 83, 85, 84, 32, 32, 0          ; VSUT
+  Data.a 22, 86, 65, 68, 68, 66, 32, 0          ; VADDB
+  Data.a 23, 86, 83, 85, 66, 66, 32, 0          ; VSUBB
+  Data.a 24, 86, 65, 67, 67, 66, 32, 0          ; VACCB
+  Data.a 25, 86, 83, 85, 67, 66, 32, 0          ; VSUCB
+  Data.a 26, 86, 83, 65, 68, 32, 32, 0          ; VSAD
+  Data.a 27, 86, 83, 65, 67, 32, 32, 0          ; VSAC
+  Data.a 28, 86, 83, 85, 77, 32, 32, 0          ; VSUM
+  Data.a 30, 86, 51, 48, 32, 32, 32, 0          ; V30
+  Data.a 31, 86, 51, 49, 32, 32, 32, 0          ; V31
+  Data.a 46, 86, 52, 54, 32, 32, 32, 0          ; V46
+  Data.a 47, 86, 52, 55, 32, 32, 32, 0          ; V47
+  Data.a 55, 86, 78, 79, 80, 32, 32, 0          ; VNOP
+  Data.a 56, 86, 69, 88, 84, 84, 32, 0          ; VEXTT
+  Data.a 57, 86, 69, 88, 84, 81, 32, 0          ; VEXTQ
+  Data.a 58, 86, 69, 88, 84, 78, 32, 0          ; VEXTN
+  Data.a 59, 86, 53, 57, 32, 32, 32, 0          ; V59
+  Data.a 60, 86, 73, 78, 83, 84, 32, 0          ; VINST
+  Data.a 61, 86, 73, 78, 83, 81, 32, 0          ; VINSQ
+  Data.a 62, 86, 73, 78, 83, 78, 32, 0          ; VINSN
+  Data.a 63, 86, 78, 85, 76, 76, 32, 0          ; VNULL
+; case 0's vs and vt: the edges of a signed and an unsigned halfword
+EdgeS:
+  Data.w 0, 1, $7FFF, $8000, $FFFF, $0100, $00FF, $5555
+EdgeT:
+  Data.w $FFFF, $8000, $7FFF, 1, 0, $AAAA, $1234, $8001
+TitleText:
+  Data.a 82, 83, 80, 32, 82, 69, 83, 69, 82, 86, 69, 68, 32, 79, 80, 67, 79, 68, 69, 32, 70, 85, 90, 90, 32, 32, 32, 32, 32, 32   ; RSP RESERVED OPCODE FUZZ
+CasesText:
+  Data.a 67, 65, 83, 69, 83, 32                 ; CASES
+OfText:
+  Data.a 32, 79, 70, 32                         ;  OF
+AllText:
+  Data.a 65, 76, 76, 32                         ; ALL
+VeeText:
+  Data.a 86, 0                                  ; V
+DotText:
+  Data.a 46, 0                                  ; .
+FailText:
+  Data.a 84, 72, 69, 32, 82, 83, 80, 32, 80, 82, 79, 71, 82, 65, 77, 32, 68, 73, 68, 32, 78, 79, 84, 32, 76, 79, 65, 68, 32, 32, 32, 32   ; THE RSP PROGRAM DID NOT LOAD
+EndDataSection

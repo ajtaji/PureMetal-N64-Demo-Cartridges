@@ -1,0 +1,13 @@
+# made by the build
+*.bin
+*.bin.dbg
+*.bin.sym
+*.sym
+*.asm
+*.rspbin
+*.pmft
+PureMetalDemo/*.z64
+TrueTypeDemo/*.z64
+WardensMarch/*.z64
+RspFuzz/*.z64
+dist/
